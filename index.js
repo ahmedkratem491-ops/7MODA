@@ -4,7 +4,16 @@ const {
 } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer } = require('@discordjs/voice');
 const { GoogleGenAI } = require('@google/genai');
-const config = require('./config.json');
+let config = {};
+try {
+    config = require('./config.json');
+} catch (e) {
+    config = {
+        token: process.env.token,
+        clientId: process.env.clientId,
+        geminiApiKey: process.env.geminiApiKey
+    };
+}
 
 // إعداد الذكاء الاصطناعي
 const ai = new GoogleGenAI({ apiKey: config.geminiApiKey });
