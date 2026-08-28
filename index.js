@@ -1,259 +1,236 @@
-const { 
-    Client, GatewayIntentBits, Partials, EmbedBuilder, 
-    PermissionFlagsBits, ChannelType 
-} = require('discord.js');
 const express = require('express');
+const { 
+    Client, 
+    GatewayIntentBits, 
+    REST, 
+    Routes, 
+    SlashCommandBuilder, 
+    PermissionFlagsBits, 
+    MessageFlags 
+} = require('discord.js');
+
+// --- 1. خادم HTTP لإبقاء البوت شغال على Render ---
 const app = express();
 const port = process.env.PORT || 3000;
+app.get('/', (req, res) => res.send('Bot is online!'));
+app.listen(port, () => console.log(`Server is running on port ${port}`));
 
-app.get('/', (req, res) => {
-    res.send('Bot is online!');
-});
-
-app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
-});
-const { joinVoiceChannel, createAudioPlayer } = require('@discordjs/voice');
-const { GoogleGenAI } = require('@google/genai');
-let config = {};
-try {
-    config = require('./config.json');
-} catch (e) {
-    config = {
-        token: process.env.token,
-        clientId: process.env.clientId,
-        geminiApiKey: process.env.geminiApiKey
-    };
-}
-
-// إعداد الذكاء الاصطناعي
-const ai = new GoogleGenAI({ apiKey: config.geminiApiKey });
-
+// --- 2. إعداد البوت والـ Intents ---
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildVoiceStates
-    ],
-    partials: [Partials.Channel, Partials.Message, Partials.GuildMember]
+        GatewayIntentBits.MessageContent
+    ]
 });
 
-// قواعد البيانات المؤقتة في الذاكرة
-let ignoredCategories = new Set();
-let logChannelId = null;
+// قاعدة بيانات مصغرة في الذاكرة لتخزين التحذيرات
+// (في حال إعادة تشغيل البوت ستبقى الذاكرة مسجلة خلال فترة التشغيل)
+const warningsDB = new Map(); 
 
-// ضبط معدل التفاعل البشري في الشات (5 رسائل كحد أقصى كل 30 دقيقة)
-let chatInteractionCount = 0;
-setInterval(() => { chatInteractionCount = 0; }, 30 * 60 * 1000);
+// ⚠️ ضع هنا التوكين وآيدي روم اللوغ الخاص بك
+const TOKEN = process.env.DISCORD_TOKEN; // أو ضع التوكين بين علامات " "
+const LOG_CHANNEL_ID = 'ضع_هنا_ID_روم_اللوغ';
 
-// دالة مساعدة لإرسال السجلات (Logs)
-async function sendLog(guild, title, description, color = 'Blue') {
-    if (!logChannelId) return;
-    const logChan = guild.channels.cache.get(logChannelId);
-    if (!logChan) return;
+// --- 3. تعريف أوامر السلاش (Slash Commands) ---
+const commands = [
+    // أمر التحذير /warn
+    new SlashCommandBuilder()
+        .setName('warn')
+        .setDescription('تحذير عضو وتطبيق تايم أوت تلقائي')
+        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+        .addUserOption(opt => opt.setName('user').setDescription('العضو المستهدف').setRequired(true))
+        .addStringOption(opt => opt.setName('reason').setDescription('سبب التحذير').setRequired(false)),
 
-    const embed = new EmbedBuilder()
-        .setTitle(title)
-        .setDescription(description)
-        .setColor(color)
-        .setTimestamp();
+    // أمر عرض سجل التحذيرات /history
+    new SlashCommandBuilder()
+        .setName('history')
+        .setDescription('عرض سجل تحذيرات عضو معين')
+        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+        .addUserOption(opt => opt.setName('user').setDescription('العضو المستهدف').setRequired(true)),
 
-    logChan.send({ embeds: [embed] }).catch(() => {});
-}
+    // أمر إلغاء تحذير معّين /unwarn
+    new SlashCommandBuilder()
+        .setName('unwarn')
+        .setDescription('إلغاء تحذير محدد لعضو برقم التحذير')
+        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+        .addUserOption(opt => opt.setName('user').setDescription('العضو المستهدف').setRequired(true))
+        .addIntegerOption(opt => opt.setName('warn_id').setDescription('رقم التحذير المراد حذفه').setRequired(true)),
 
-// ----------------------------------------------------
-// 1. تشغيل البوت والربط بالصوت 24/7 (AFK Voice Connection)
-// ----------------------------------------------------
-client.once('clientReady', async () => {
+    // أمر إزالة التايم أوت /untimeout
+    new SlashCommandBuilder()
+        .setName('untimeout')
+        .setDescription('إلغاء التايم أوت عن عضو')
+        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+        .addUserOption(opt => opt.setName('user').setDescription('العضو المستهدف').setRequired(true))
+].map(cmd => cmd.toJSON());
+
+// --- 4. تسجيل الأوامر عند الإقلاع ---
+client.once('ready', async () => {
     console.log(`✅ تم تشغيل البوت بنجاح باسم: ${client.user.tag}`);
-
-    // الانضمام الدائم للروم الصوتي
-    if (config.afkVoiceChannelId) {
-        try {
-            const guild = client.guilds.cache.get(config.guildId);
-            const voiceChannel = guild?.channels.cache.get(config.afkVoiceChannelId);
-
-            if (voiceChannel) {
-                joinVoiceChannel({
-                    channelId: voiceChannel.id,
-                    guildId: voiceChannel.guild.id,
-                    adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-                    selfDeaf: true,  // كتم السماعة لتوفير الموارد
-                    selfMute: true   // كتم المايك
-                });
-                console.log(`🎙️ تم الاتصال بالروم الصوتي 24/7: ${voiceChannel.name}`);
-            }
-        } catch (err) {
-            console.error('❌ تعذر الاتصال بالروم الصوتي:', err.message);
-        }
+    
+    const rest = new REST({ version: '10' }).setToken(TOKEN || client.token);
+    try {
+        await rest.put(
+            Routes.applicationCommands(client.user.id),
+            { body: commands }
+        );
+        console.log('✅ تم تسجيل جميع أوامر السلاش بنجاح!');
+    } catch (error) {
+        console.error('خطأ أثناء تسجيل الأوامر:', error);
     }
 });
 
-// ----------------------------------------------------
-// 2. معالجة أوامر السلاش (Slash Commands Handling)
-// ----------------------------------------------------
-client.on('interactionCreate', async interaction => {
+// --- 5. التعامل مع أوامر السلاش ---
+client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
-    const { commandName, options, guild, member } = interaction;
+    const { commandName, options, guild } = interaction;
+    const targetUser = options.getUser('user');
+    const member = await guild.members.fetch(targetUser.id).catch(() => null);
+    const logChannel = await guild.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
 
-    // أمر Ping
-    if (commandName === 'ping') {
-        return interaction.reply({ content: `🏓 سرعة الاستجابة: \`${client.ws.ping}ms\``, ephemeral: true });
+    if (!member) {
+        return interaction.reply({ content: '❌ لم يتم العثور على هذا العضو في السيرفر.', flags: MessageFlags.Ephemeral });
     }
 
-    // أمر تحديد روم السجلات
-    if (commandName === 'setlog') {
-        const channel = options.getChannel('channel');
-        logChannelId = channel.id;
-        await sendLog(guild, '⚙️ تحديث الإعدادات', `تم تعيين القناة ${channel} كـ روم للسجلات بواسطة ${member}`);
-        return interaction.reply({ content: `✅ تم تعيين روم السجلات بنجاح: ${channel}`, ephemeral: true });
-    }
-
-    // أمر استثناء فئة من الحماية
-    if (commandName === 'ignorecategory') {
-        const category = options.getChannel('category');
-        if (ignoredCategories.has(category.id)) {
-            ignoredCategories.delete(category.id);
-            return interaction.reply({ content: `✅ تم تفعيل الحماية للفئة: **${category.name}**`, ephemeral: true });
-        } else {
-            ignoredCategories.add(category.id);
-            return interaction.reply({ content: `🛡️ تم استثناء الفئة من الحماية: **${category.name}**`, ephemeral: true });
-        }
-    }
-
-    // أمر التحذير (Warn)
+    // --- أمر التحذير (/warn) ---
     if (commandName === 'warn') {
-        const target = options.getUser('target');
-        const reason = options.getString('reason');
-
-        await sendLog(guild, '⚠️ تحذير جديد', `**المستهدف:** ${target}\n**بواسطة:** ${member}\n**السبب:** ${reason}`, 'Yellow');
-        return interaction.reply({ content: `✅ تم إرسال تحذير إلى ${target} بنجاح.` });
-    }
-
-    // أمر التايم أوت (Timeout)
-    if (commandName === 'timeout') {
-        const targetMember = options.getMember('target');
-        const duration = options.getInteger('duration');
-        const reason = options.getString('reason') || 'لم يُذكر سبب';
-
-        if (!targetMember) return interaction.reply({ content: '❌ العضو غير موجود بالسيرفر.', ephemeral: true });
-
-        await targetMember.timeout(duration * 60 * 1000, reason);
-        await sendLog(guild, '⏳ تايم أوت (Timeout)', `**العضو:** ${targetMember}\n**المدة:** ${duration} دقيقة\n**السبب:** ${reason}`, 'Orange');
-        return interaction.reply({ content: `✅ تم تطبيق تايم أوت على ${targetMember} لمدة ${duration} دقيقة.` });
-    }
-
-    // أمر الطرد (Kick)
-    if (commandName === 'kick') {
-        const targetMember = options.getMember('target');
-        const reason = options.getString('reason') || 'بدون سبب';
-
-        if (!targetMember) return interaction.reply({ content: '❌ العضو غير موجود.', ephemeral: true });
-
-        await targetMember.kick(reason);
-        await sendLog(guild, '👞 طرد عضو (Kick)', `**العضو:** ${targetMember.user.tag}\n**بواسطة:** ${member}\n**السبب:** ${reason}`, 'Red');
-        return interaction.reply({ content: `✅ تم طرد ${targetMember.user.tag} من السيرفر.` });
-    }
-
-    // أمر الحظر (Ban)
-    if (commandName === 'ban') {
-        const targetUser = options.getUser('target');
-        const reason = options.getString('reason') || 'بدون سبب';
-
-        await guild.members.ban(targetUser.id, { reason });
-        await sendLog(guild, '🔨 حظر عضو (Ban)', `**العضو:** ${targetUser.tag}\n**بواسطة:** ${member}\n**السبب:** ${reason}`, 'DarkRed');
-        return interaction.reply({ content: `✅ تم حظر ${targetUser.tag} بنجاح.` });
-    }
-
-    // أمر إلغاء الحظر (Unban)
-    if (commandName === 'unban') {
-        const userId = options.getString('userid');
-        try {
-            await guild.members.unban(userId);
-            await sendLog(guild, '🔓 إلغاء حظر', `تم إلغاء الحظر عن المستخدم ID: \`${userId}\` بواسطة ${member}`, 'Green');
-            return interaction.reply({ content: `✅ تم إلغاء حظر المستخدم بنجاح.` });
-        } catch (e) {
-            return interaction.reply({ content: '❌ تعذر العثور على حظر لهذا الرقم ID.', ephemeral: true });
+        const reason = options.getString('reason') || 'لا يوجد سبب محدد';
+        
+        // حفظ التحذير في السجل
+        if (!warningsDB.has(targetUser.id)) {
+            warningsDB.set(targetUser.id, []);
         }
+        const userWarns = warningsDB.get(targetUser.id);
+        const warnId = userWarns.length + 1;
+        userWarns.push({ id: warnId, reason, moderator: interaction.user.tag, date: new Date().toLocaleString('ar-EG') });
+
+        // 1. إرسال للخاص
+        try {
+            await targetUser.send(`⚠️ **تنبيه:** تلقيت تحذيراً رقم (#${warnId}) في سيرفر **${guild.name}**\n**السبب:** ${reason}`);
+        } catch (err) {
+            console.log('لم يتم إرسال الخاص (الخاص مقفل من المستخدم).');
+        }
+
+        // 2. تطبيق تايم أوت (دقيقة كمثال)
+        try {
+            await member.timeout(60 * 1000, reason);
+        } catch (err) {
+            console.log('فشل تطبيق التايم أوت بسبب نقص الصلاحيات أو ترتيب الرتب.');
+        }
+
+        // 3. إرسال اللوغ
+        if (logChannel) {
+            await logChannel.send(
+                `⚠️ **تحذير جديد (#${warnId}):**\n` +
+                `• **المستهدف:** ${targetUser.tag} (${targetUser})\n` +
+                `• **المشرف:** ${interaction.user.tag}\n` +
+                `• **السبب:** ${reason}`
+            );
+        }
+
+        await interaction.reply({ content: `✅ تم تحذير ${targetUser.tag} بنجاح (تحذير رقم #${warnId}).`, flags: MessageFlags.Ephemeral });
     }
 
-    // أمر مسح الرسائل (Clear)
-    if (commandName === 'clear') {
-        const amount = options.getInteger('amount');
-        if (amount < 1 || amount > 100) return interaction.reply({ content: '⚠️ أدخل رقماً بين 1 و 100.', ephemeral: true });
+    // --- أمر السجل (/history) ---
+    if (commandName === 'history') {
+        const userWarns = warningsDB.get(targetUser.id) || [];
+        if (userWarns.length === 0) {
+            return interaction.reply({ content: `ℹ️ العضو ${targetUser.tag} ليس لديه أي تحذيرات مسجلة.`, flags: MessageFlags.Ephemeral });
+        }
 
-        const deleted = await interaction.channel.bulkDelete(amount, true);
-        await sendLog(guild, '🧹 تنظيف الشات', `تم حذف **${deleted.size}** رسالة في القناة ${interaction.channel} بواسطة ${member}`, 'Purple');
-        return interaction.reply({ content: `✅ تم حذف ${deleted.size} رسالة بنجاح.`, ephemeral: true });
+        let historyText = `📜 **سجل تحذيرات ${targetUser.tag}:**\n\n`;
+        userWarns.forEach(w => {
+            historyText += `🔹 **رقم التحذير:** #${w.id}\n• **السبب:** ${w.reason}\n• **بواسطة:** ${w.moderator}\n• **التاريخ:** ${w.date}\n-------------------\n`;
+        });
+
+        await interaction.reply({ content: historyText, flags: MessageFlags.Ephemeral });
     }
-});
 
-// ----------------------------------------------------
-// 3. الترحب بالإعضاء الجدد والمنشن في الشات
-// ----------------------------------------------------
-client.on('guildMemberAdd', async member => {
-    // إرسال سجل دخول
-    await sendLog(member.guild, '📥 دخول عضو جديد', `انضم العضو: ${member} (\`${member.id}\`)`, 'Green');
+    // --- أمر إلغاء التحذير (/unwarn) ---
+    if (commandName === 'unwarn') {
+        const warnId = options.getInteger('warn_id');
+        let userWarns = warningsDB.get(targetUser.id) || [];
 
-    // الترحيب المباشر في القناة العامة
-    const systemChannel = member.guild.systemChannel;
-    if (systemChannel) {
-        const welcomeGreet = `منور السيرفر يا ${member}! 🌹 نورتنا نتمنى لك وقتاً ممتعاً.`;
-        systemChannel.send(welcomeGreet).catch(() => {});
+        const index = userWarns.findIndex(w => w.id === warnId);
+        if (index === -1) {
+            return interaction.reply({ content: `❌ لم يتم العثور على تحذير برقم (#${warnId}) لهذا العضو.`, flags: MessageFlags.Ephemeral });
+        }
+
+        userWarns.splice(index, 1);
+        warningsDB.set(targetUser.id, userWarns);
+
+        if (logChannel) {
+            await logChannel.send(
+                `🟢 **إلغاء تحذير:**\n` +
+                `• **العضو:** ${targetUser.tag}\n` +
+                `• **رقم التحذير المزال:** #${warnId}\n` +
+                `• **بواسطة المشرف:** ${interaction.user.tag}`
+            );
+        }
+
+        await interaction.reply({ content: `✅ تم إلغاء التحذير رقم (#${warnId}) عن ${targetUser.tag}.`, flags: MessageFlags.Ephemeral });
     }
-});
 
-// ----------------------------------------------------
-// 4. التفاعل الإنساني الموزون في الشات العامة (Human Chat)
-// ----------------------------------------------------
-client.on('messageCreate', async message => {
-    if (message.author.bot || !message.guild) return;
+    // --- أمر إلغاء التايم أوت (/untimeout) ---
+    if (commandName === 'untimeout') {
+        try {
+            await member.timeout(null);
 
-    // التفاعل مع الفيديوهات والمنشورات داخل قنوات الفورم (Forum Threads)
-    if (message.channel.isThread() && message.channel.parent?.type === ChannelType.GuildForum) {
-        if (message.attachments.size > 0) {
-            try {
-                const response = await ai.models.generateContent({
-                    model: 'gemini-2.5-flash',
-                    contents: 'علّق بإعجاب واحترافية وبشكل مشجع وقصير جداً باللغة العربية على هذا التصميم/المنشور المرفق.'
-                });
-                await message.reply(`${response.text}\nCc: @Designers`);
-            } catch (err) {
-                console.error('AI Forum Error:', err);
+            if (logChannel) {
+                await logChannel.send(
+                    `🔊 **إزالة التايم أوت:**\n` +
+                    `• **العضو:** ${targetUser.tag} (${targetUser})\n` +
+                    `• **بواسطة المشرف:** ${interaction.user.tag}`
+                );
             }
-        }
-        return;
-    }
 
-    // التفاعل الطبيعي القليل مع الشات العامة (أقصى حد 5 رسائل كل 30 دقيقة)
-    if (chatInteractionCount < 5 && Math.random() < 0.05) { // احتمال خفيف للرد
-        try {
-            chatInteractionCount++;
-            const response = await ai.models.generateContent({
-                model: 'gemini-2.5-flash',
-                contents: `رد بشكل عفوي وقصير جداً بلغة عربية عامية بسيطة كأنك عضو عادي بالسيرفر على هذه الرسالة: "${message.content}"`
-            });
-            message.channel.sendTyping();
-            setTimeout(() => {
-                message.reply(response.text).catch(() => {});
-            }, 2000);
-        } catch (e) {}
+            await interaction.reply({ content: `✅ تم إلغاء التايم أوت عن ${targetUser.tag}.`, flags: MessageFlags.Ephemeral });
+        } catch (err) {
+            await interaction.reply({ content: '❌ فشل إزالة التايم أوت! تأكد أن رتبة البوت أعلى من العضو.', flags: MessageFlags.Ephemeral });
+        }
     }
 });
 
-// ----------------------------------------------------
-// 5. سجل حماية الفئات وحذف القنوات (Protection Logs)
-// ----------------------------------------------------
-client.on('channelDelete', async channel => {
-    if (channel.parentId && ignoredCategories.has(channel.parentId)) {
-        console.log(`تم تجاهل حذف القناة لتبعيتها لفئة مستثناة: ${channel.parentId}`);
-        return;
-    }
-    await sendLog(channel.guild, '🚨 حذف قناة', `تم حذف القناة: **${channel.name}**`, 'Red');
+// --- 6. لوغ حذف وتعديل الرسائل ---
+
+// لوغ الحذف
+client.on('messageDelete', async (message) => {
+    if (message.author?.bot || !message.guild) return;
+    try {
+        const logChannel = await message.guild.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
+        if (!logChannel) return;
+
+        const content = message.content || 'محتوى غير نصي (صورة أو مرفق)';
+        await logChannel.send(
+            `🗑️ **تم حذف رسالة:**\n` +
+            `• **العضو:** ${message.author.tag} (${message.author})\n` +
+            `• **الروم:** ${message.channel}\n` +
+            `• **المحتوى:**\n> ${content}`
+        );
+    } catch (e) { console.error(e); }
+});
+
+// لوغ التعديل
+client.on('messageUpdate', async (oldMessage, newMessage) => {
+    if (oldMessage.author?.bot || !oldMessage.guild) return;
+    if (oldMessage.content === newMessage.content) return;
+
+    try {
+        const logChannel = await oldMessage.guild.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
+        if (!logChannel) return;
+
+        await logChannel.send(
+            `✏️ **تم تعديل رسالة:**\n` +
+            `• **العضو:** ${oldMessage.author.tag} (${oldMessage.author})\n` +
+            `• **الروم:** ${oldMessage.channel}\n` +
+            `• **قبل:** ${oldMessage.content || 'غير نصي'}\n` +
+            `• **بعد:** ${newMessage.content || 'غير نصي'}\n` +
+            `• **الرابط:** [انتقل للرسالة](${newMessage.url})`
+        );
+    } catch (e) { console.error(e); }
 });
 
 // تسجيل الدخول
-client.login(config.token);
+client.login(TOKEN);
