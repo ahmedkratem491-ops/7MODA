@@ -7,8 +7,10 @@
   },
   "dependencies": {
     "@discordjs/voice": "latest",
-    "@google/genai": "latest",
+    "@google/generative-ai": "latest",
     "discord.js": "latest",
-    "express": "latest"
+    "express": "latest",
+    "sodium-native": "latest",
+    "libsodium-wrappers": "latest"
   }
 }
