@@ -8,7 +8,8 @@ const {
     PermissionFlagsBits, 
     MessageFlags,
     ChannelType,
-    AuditLogEvent
+    AuditLogEvent,
+    EmbedBuilder
 } = require('discord.js');
 const { 
     joinVoiceChannel, 
@@ -24,8 +25,9 @@ app.get('/', (req, res) => res.send('Bot is online!'));
 app.listen(port, () => console.log(`Server is running on port ${port}`));
 
 // --- 2. إعداد الـ AI والبوت والـ Intents ---
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'ضع_مفتاح_الـ_API_هنا';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+// استخدام نموذج gemini-1.5-flash المستقر
 const aiModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
 const client = new Client({
@@ -41,11 +43,11 @@ const client = new Client({
 // قواعد البيانات في الذاكرة
 const warningsDB = new Map(); 
 const logChannelsDB = new Map();
-const autoChatSettings = new Map(); // { guildId: { enabled: boolean, channelId: string } }
-const afkVoiceChannels = new Map(); // { guildId: channelId }
+const autoChatSettings = new Map(); 
+const afkVoiceChannels = new Map(); 
 let autoChatInterval = null;
 
-const TOKEN = process.env.DISCORD_TOKEN || 'ضع_التوكين_هنا';
+const TOKEN = process.env.DISCORD_TOKEN || '';
 
 function parseDuration(durationStr) {
     if (!durationStr) return null;
@@ -82,7 +84,6 @@ function connectToAfkVoice(guild, channelId) {
                     new Promise(resolve => connection.on(VoiceConnectionStatus.Connecting, resolve)),
                 ]);
             } catch (e) {
-                // في حال انقطع الاتصال يتم إعادة الدخول تلقائياً
                 setTimeout(() => connectToAfkVoice(guild, channelId), 5000);
             }
         });
@@ -104,7 +105,6 @@ const commands = [
                 .setRequired(true)
         ),
 
-    // أمر التحكم بالدردشة التلقائية كل 30 دقيقة
     new SlashCommandBuilder()
         .setName('autochat')
         .setDescription('تفعيل أو إيقاف الدردشة التلقائية للذكاء الاصطناعي كل 30 دقيقة')
@@ -125,7 +125,6 @@ const commands = [
                 .setRequired(false)
         ),
 
-    // أمر بقاء البوت 24/7 في الفويس (AFK Voice)
     new SlashCommandBuilder()
         .setName('afkvoice')
         .setDescription('جعل البوت متواجد في روم صوتي معين 24/7 بدون خروج')
@@ -148,7 +147,7 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName('warn')
-        .setDescription('تحذير عضو وتطبيق تايم أوت تلقائي عليه')
+        .setDescription('تحذير عضو وتسجيل التحذير فقط دون تايم أوت')
         .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
         .addUserOption(opt => opt.setName('user').setDescription('العضو المستهدف').setRequired(true))
         .addStringOption(opt => opt.setName('reason').setDescription('سبب التحذير').setRequired(false)),
@@ -184,7 +183,7 @@ const commands = [
         .setName('kick')
         .setDescription('طرد عضو من السيرفر')
         .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers)
-        .addUserOption(opt => opt.setName('user').setDescription('العضو المرادطرده').setRequired(true))
+        .addUserOption(opt => opt.setName('user').setDescription('العضو المراد طرده').setRequired(true))
         .addStringOption(opt => opt.setName('reason').setDescription('سبب الطرد').setRequired(false)),
 
     new SlashCommandBuilder()
@@ -215,7 +214,6 @@ client.once('ready', async () => {
         console.error('خطأ أثناء تسجيل الأوامر:', error);
     }
 
-    // إعداد الـ Timer للدردشة التلقائية كل 30 دقيقة (30 * 60 * 1000 ms)
     if (!autoChatInterval) {
         autoChatInterval = setInterval(async () => {
             for (const [guildId, config] of autoChatSettings.entries()) {
@@ -228,11 +226,9 @@ client.once('ready', async () => {
 
                     const prompt = "اكتب رسالة قصيرة، لطيفة وتفاعلية للدردشة مع الأعضاء في السيرفر لفتح موضوع نقاش جانبي مسلي.";
                     const result = await aiModel.generateContent(prompt);
-                    const replyText = result.response.text();
-
-                    await channel.send(replyText);
+                    await channel.send(result.response.text());
                 } catch (e) {
-                    console.error('خطأ في إرسال الـ Auto-Chat:', e);
+                    console.error('خطأ في الـ Auto-Chat:', e);
                 }
             }
         }, 30 * 60 * 1000);
@@ -255,28 +251,33 @@ client.on('interactionCreate', async (interaction) => {
     if (commandName === 'log') {
         const selectedChannel = options.getChannel('channel');
         logChannelsDB.set(guild.id, selectedChannel.id);
-        await selectedChannel.send(`✅ تم تعيين هذه القناة لاستقبال جميع لوغات وتنبيهات البوت بنجاح!`);
-        return interaction.reply({ content: `✅ تم ضبط روم اللوغ بنجاح على القناة ${selectedChannel}.`, flags: MessageFlags.Ephemeral });
+
+        const embed = new EmbedBuilder()
+            .setTitle('⚙️ Log Channel Set')
+            .setDescription(`Log channel updated to ${selectedChannel}`)
+            .setColor(0x00FF7F)
+            .setTimestamp();
+
+        await selectedChannel.send({ embeds: [embed] });
+        return interaction.reply({ content: `✅ تم ضبط روم اللوغ بنجاح على ${selectedChannel}.`, flags: MessageFlags.Ephemeral });
     }
 
-    // --- أمر /autochat ---
     if (commandName === 'autochat') {
         const status = options.getString('status');
         const channel = options.getChannel('channel');
 
         if (status === 'on') {
             if (!channel) {
-                return interaction.reply({ content: '❌ يجب عليك اختيار القناة النصية المراد التحدث فيها عند التفعيل!', flags: MessageFlags.Ephemeral });
+                return interaction.reply({ content: '❌ يجب اختيار القناة النصية المراد التحدث فيها عند التفعيل!', flags: MessageFlags.Ephemeral });
             }
             autoChatSettings.set(guild.id, { enabled: true, channelId: channel.id });
-            return interaction.reply({ content: `✅ تم تفعيل الدردشة التلقائية كل 30 دقيقة في القناة ${channel}.`, flags: MessageFlags.Ephemeral });
+            return interaction.reply({ content: `✅ تم تفعيل الدردشة التلقائية كل 30 دقيقة في ${channel}.`, flags: MessageFlags.Ephemeral });
         } else {
             autoChatSettings.set(guild.id, { enabled: false, channelId: null });
-            return interaction.reply({ content: `🛑 تم إيقاف الدردشة التلقائية بنجاح.`, flags: MessageFlags.Ephemeral });
+            return interaction.reply({ content: `🛑 تم إيقاف الدردشة التلقائية.`, flags: MessageFlags.Ephemeral });
         }
     }
 
-    // --- أمر /afkvoice ---
     if (commandName === 'afkvoice') {
         const action = options.getString('action');
         const channel = options.getChannel('channel');
@@ -296,38 +297,69 @@ client.on('interactionCreate', async (interaction) => {
         }
     }
 
+    // أمر التحذير (بدون تايم أوت تلقائي)
     if (commandName === 'warn') {
         const targetUser = options.getUser('user');
-        const member = await guild.members.fetch(targetUser.id).catch(() => null);
         const reason = options.getString('reason') || 'لا يوجد سبب محدد';
-
-        if (!member) return interaction.reply({ content: '❌ لم يتم العثور على العضو.', flags: MessageFlags.Ephemeral });
 
         if (!warningsDB.has(targetUser.id)) warningsDB.set(targetUser.id, []);
         const userWarns = warningsDB.get(targetUser.id);
         const warnId = userWarns.length + 1;
-        userWarns.push({ id: warnId, reason, moderator: interaction.user.tag, date: new Date().toLocaleString('ar-EG') });
+
+        // تاريخ بتنسيق الأرقام واللغة الإنجليزية
+        const formattedDate = new Date().toLocaleString('en-US', {
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: true
+        });
+
+        userWarns.push({ id: warnId, reason, moderator: interaction.user.tag, date: formattedDate });
 
         try { await targetUser.send(`⚠️ **تنبيه:** تلقيت تحذيراً رقم (#${warnId}) في سيرفر **${guild.name}**\n**السبب:** ${reason}`); } catch (e) {}
-        try { await member.timeout(60 * 1000, reason); } catch (e) {}
 
         if (logChannel) {
-            await logChannel.send(`⚠️ **تحذير جديد (#${warnId}):**\n• **المستهدف:** ${targetUser.tag}\n• **المشرف:** ${interaction.user.tag}\n• **السبب:** ${reason}`);
+            const embed = new EmbedBuilder()
+                .setTitle('⚠️ Member Warned')
+                .setColor(0xFFA500)
+                .addFields(
+                    { name: 'User', value: `${targetUser} (\`${targetUser.id}\`)`, inline: true },
+                    { name: 'Moderator', value: `${interaction.user} (\`${interaction.user.id}\`)`, inline: true },
+                    { name: 'Warn ID', value: `#${warnId}`, inline: true },
+                    { name: 'Reason', value: reason }
+                )
+                .setTimestamp();
+            await logChannel.send({ embeds: [embed] });
         }
         await interaction.reply({ content: `✅ تم تحذير ${targetUser.tag} برقم (#${warnId}).`, flags: MessageFlags.Ephemeral });
     }
 
+    // أمر التاريخ (تنسيق أنيق بأرقام عادية)
     if (commandName === 'history') {
         const targetUser = options.getUser('user');
         const userWarns = warningsDB.get(targetUser.id) || [];
+
         if (userWarns.length === 0) {
-            return interaction.reply({ content: `ℹ️ العضو ${targetUser.tag} ليس لديه تحذيرات.`, flags: MessageFlags.Ephemeral });
+            return interaction.reply({ content: `ℹ️ العضو ${targetUser.tag} ليس لديه أي تحذيرات.`, flags: MessageFlags.Ephemeral });
         }
-        let historyText = `📜 **سجل تحذيرات ${targetUser.tag}:**\n\n`;
+
+        const embed = new EmbedBuilder()
+            .setTitle(`📜 Warning History - ${targetUser.tag}`)
+            .setColor(0x3498DB)
+            .setThumbnail(targetUser.displayAvatarURL())
+            .setFooter({ text: `Total Warnings: ${userWarns.length}` })
+            .setTimestamp();
+
         userWarns.forEach(w => {
-            historyText += `🔹 **رقم التحذير:** #${w.id}\n• **السبب:** ${w.reason}\n• **بواسطة:** ${w.moderator}\n• **التاريخ:** ${w.date}\n-------------------\n`;
+            embed.addFields({
+                name: `Warn #${w.id} - ${w.date}`,
+                value: `**Reason:** ${w.reason}\n**By:** ${w.moderator}`
+            });
         });
-        await interaction.reply({ content: historyText, flags: MessageFlags.Ephemeral });
+
+        await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
 
     if (commandName === 'unwarn') {
@@ -342,7 +374,16 @@ client.on('interactionCreate', async (interaction) => {
 
         userWarns.splice(index, 1);
         if (logChannel) {
-            await logChannel.send(`🟢 **إلغاء تحذير:**\n• **العضو:** ${targetUser.tag}\n• **التحذير المزال:** #${warnId}\n• **المشرف:** ${interaction.user.tag}`);
+            const embed = new EmbedBuilder()
+                .setTitle('🟢 Warning Removed')
+                .setColor(0x2ECC71)
+                .addFields(
+                    { name: 'User', value: `${targetUser} (\`${targetUser.id}\`)`, inline: true },
+                    { name: 'Moderator', value: `${interaction.user}`, inline: true },
+                    { name: 'Removed Warn ID', value: `#${warnId}`, inline: true }
+                )
+                .setTimestamp();
+            await logChannel.send({ embeds: [embed] });
         }
         await interaction.reply({ content: `✅ تم إلغاء التحذير (#${warnId}) عن ${targetUser.tag}.`, flags: MessageFlags.Ephemeral });
     }
@@ -363,7 +404,17 @@ client.on('interactionCreate', async (interaction) => {
         try {
             await member.timeout(ms, reason);
             if (logChannel) {
-                await logChannel.send(`🔇 **تايم أوت:**\n• **العضو:** ${targetUser.tag}\n• **المدة:** ${durationInput}\n• **المشرف:** ${interaction.user.tag}\n• **السبب:** ${reason}`);
+                const embed = new EmbedBuilder()
+                    .setTitle('🔇 Member Muted (Timeout)')
+                    .setColor(0xE67E22)
+                    .addFields(
+                        { name: 'User', value: `${targetUser} (\`${targetUser.id}\`)`, inline: true },
+                        { name: 'Moderator', value: `${interaction.user}`, inline: true },
+                        { name: 'Duration', value: durationInput, inline: true },
+                        { name: 'Reason', value: reason }
+                    )
+                    .setTimestamp();
+                await logChannel.send({ embeds: [embed] });
             }
             await interaction.reply({ content: `✅ تم تطبيق تايم أوت على ${targetUser.tag} لمدة ${durationInput}.`, flags: MessageFlags.Ephemeral });
         } catch (err) {
@@ -380,7 +431,15 @@ client.on('interactionCreate', async (interaction) => {
         try {
             await member.timeout(null);
             if (logChannel) {
-                await logChannel.send(`🔊 **إزالة تايم أوت:**\n• **العضو:** ${targetUser.tag}\n• **المشرف:** ${interaction.user.tag}`);
+                const embed = new EmbedBuilder()
+                    .setTitle('🔊 Member Unmuted')
+                    .setColor(0x2ECC71)
+                    .addFields(
+                        { name: 'User', value: `${targetUser} (\`${targetUser.id}\`)`, inline: true },
+                        { name: 'Moderator', value: `${interaction.user}`, inline: true }
+                    )
+                    .setTimestamp();
+                await logChannel.send({ embeds: [embed] });
             }
             await interaction.reply({ content: `✅ تم إلغاء التايم أوت عن ${targetUser.tag}.`, flags: MessageFlags.Ephemeral });
         } catch (err) {
@@ -398,7 +457,16 @@ client.on('interactionCreate', async (interaction) => {
         try {
             await member.kick(reason);
             if (logChannel) {
-                await logChannel.send(`👢 **طرد عضو (Kick):**\n• **المطرود:** ${targetUser.tag}\n• **المشرف:** ${interaction.user.tag}\n• **السبب:** ${reason}`);
+                const embed = new EmbedBuilder()
+                    .setTitle('👢 Member Kicked')
+                    .setColor(0xE74C3C)
+                    .addFields(
+                        { name: 'User', value: `${targetUser.tag} (\`${targetUser.id}\`)`, inline: true },
+                        { name: 'Moderator', value: `${interaction.user}`, inline: true },
+                        { name: 'Reason', value: reason }
+                    )
+                    .setTimestamp();
+                await logChannel.send({ embeds: [embed] });
             }
             await interaction.reply({ content: `✅ تم طرد ${targetUser.tag} بنجاح.`, flags: MessageFlags.Ephemeral });
         } catch (err) {
@@ -413,7 +481,16 @@ client.on('interactionCreate', async (interaction) => {
         try {
             await guild.members.ban(targetUser.id, { reason });
             if (logChannel) {
-                await logChannel.send(`🔨 **حظر عضو (Ban):**\n• **المحظور:** ${targetUser.tag}\n• **المشرف:** ${interaction.user.tag}\n• **السبب:** ${reason}`);
+                const embed = new EmbedBuilder()
+                    .setTitle('🔨 Member Banned')
+                    .setColor(0x990000)
+                    .addFields(
+                        { name: 'User', value: `${targetUser.tag} (\`${targetUser.id}\`)`, inline: true },
+                        { name: 'Moderator', value: `${interaction.user}`, inline: true },
+                        { name: 'Reason', value: reason }
+                    )
+                    .setTimestamp();
+                await logChannel.send({ embeds: [embed] });
             }
             await interaction.reply({ content: `✅ تم حظر ${targetUser.tag} بنجاح.`, flags: MessageFlags.Ephemeral });
         } catch (err) {
@@ -427,20 +504,27 @@ client.on('interactionCreate', async (interaction) => {
         try {
             await guild.members.unban(userId);
             if (logChannel) {
-                await logChannel.send(`🔓 **فك حظر (Unban):**\n• **الآيدي المحرّر:** ${userId}\n• **المشرف:** ${interaction.user.tag}`);
+                const embed = new EmbedBuilder()
+                    .setTitle('🔓 Member Unbanned')
+                    .setColor(0x2ECC71)
+                    .addFields(
+                        { name: 'User ID', value: `\`${userId}\``, inline: true },
+                        { name: 'Moderator', value: `${interaction.user}`, inline: true }
+                    )
+                    .setTimestamp();
+                await logChannel.send({ embeds: [embed] });
             }
-            await interaction.reply({ content: `✅ تم فك الحظر عن الحساب صاحب الآيدي (${userId}) بنجاح.`, flags: MessageFlags.Ephemeral });
+            await interaction.reply({ content: `✅ تم فك الحظر عن الآيدي (${userId}) بنجاح.`, flags: MessageFlags.Ephemeral });
         } catch (err) {
             await interaction.reply({ content: '❌ فشل فك الحظر!', flags: MessageFlags.Ephemeral });
         }
     }
 });
 
-// --- 6. الـ AI للرد على الفورمز و الـ Mentions ---
+// --- 6. الـ AI للرد على الفورمز والـ Mentions ---
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
 
-    // أ) الرد والمدح التلقائي عند اكتشاف إرسال نموذج / فورم (Form Submission)
     const isFormMessage = message.embeds.some(e => e.title?.toLowerCase().includes('form') || e.title?.includes('نموذج') || e.title?.includes('تقديم')) 
                           || message.content.toLowerCase().includes('form') 
                           || message.content.includes('تم إرسال نموذج');
@@ -457,7 +541,6 @@ client.on('messageCreate', async (message) => {
         }
     }
 
-    // ب) الرد بالذكاء الاصطناعي عند الإشارة للبوت (@Mention)
     if (message.mentions.has(client.user.id)) {
         const prompt = message.content.replace(/<@!?\d+>/g, '').trim();
         if (!prompt) return message.reply('نعم؟ تفضل وسلني عن أي شيء!');
@@ -474,19 +557,20 @@ client.on('messageCreate', async (message) => {
             }
         } catch (error) {
             console.error('خطأ في الـ AI:', error);
-            await message.reply('❌ حدث خطأ أثناء الاتصال بالذكاء الاصطناعي.');
+            await message.reply('❌ تعذر الاتصال بالذكاء الاصطناعي حالياً. يرجى التأكد من إعداد مفتاح `GEMINI_API_KEY` في إعدادات Render بشكل صحيح.');
         }
     }
 });
 
-// --- 7. أحداث اللوغ بالتكامل مع الـ Audit Logs ---
+// --- 7. سجلات اللوغ الاحترافية (Sapphire Style Log System) ---
 
+// أ) حذف الرسائل
 client.on('messageDelete', async (message) => {
     if (message.author?.bot || !message.guild) return;
     const logChannel = await getLogChannel(message.guild);
     if (!logChannel) return;
 
-    let executor = message.author.tag;
+    let executor = 'Unknown / Self';
     try {
         const fetchedLogs = await message.guild.fetchAuditLogs({
             limit: 1,
@@ -494,21 +578,25 @@ client.on('messageDelete', async (message) => {
         });
         const deletionLog = fetchedLogs.entries.first();
         if (deletionLog && deletionLog.target.id === message.author.id && (Date.now() - deletionLog.createdTimestamp) < 5000) {
-            executor = deletionLog.executor.tag;
+            executor = `${deletionLog.executor.tag} (${deletionLog.executor})`;
         }
     } catch (e) {}
 
-    try {
-        await logChannel.send(
-            `🗑️ **تم حذف رسالة:**\n` +
-            `• **صاحب الرسالة:** ${message.author.tag} (${message.author})\n` +
-            `• **الحاذف (الادمن/العضو):** ${executor}\n` +
-            `• **الروم:** ${message.channel}\n` +
-            `• **المحتوى:**\n> ${message.content || 'محتوى غير نصي'}`
-        );
-    } catch (e) {}
+    const embed = new EmbedBuilder()
+        .setTitle('🗑️ Message Deleted')
+        .setColor(0xFF4757)
+        .addFields(
+            { name: 'Author', value: `${message.author.tag} (${message.author})`, inline: true },
+            { name: 'Deleted By', value: executor, inline: true },
+            { name: 'Channel', value: `${message.channel}`, inline: true },
+            { name: 'Content', value: message.content ? `\`\`\`${message.content.slice(0, 1000)}\`\`\`` : '*[No text content or embed]*' }
+        )
+        .setTimestamp();
+
+    await logChannel.send({ embeds: [embed] }).catch(() => null);
 });
 
+// ب) تعديل الرسائل
 client.on('messageUpdate', async (oldMessage, newMessage) => {
     if (oldMessage.author?.bot || !oldMessage.guild) return;
     if (oldMessage.content === newMessage.content) return;
@@ -516,23 +604,28 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
     const logChannel = await getLogChannel(oldMessage.guild);
     if (!logChannel) return;
 
-    try {
-        await logChannel.send(
-            `✏️ **تم تعديل رسالة:**\n` +
-            `• **العضو:** ${oldMessage.author.tag} (${oldMessage.author})\n` +
-            `• **الروم:** ${oldMessage.channel}\n` +
-            `• **قبل:** ${oldMessage.content || 'غير نصي'}\n` +
-            `• **بعد:** ${newMessage.content || 'غير نصي'}\n` +
-            `• **الرابط:** [انتقل للرسالة](${newMessage.url})`
-        );
-    } catch (e) {}
+    const embed = new EmbedBuilder()
+        .setTitle('✏️ Message Edited')
+        .setColor(0x70A1FF)
+        .addFields(
+            { name: 'Author', value: `${oldMessage.author.tag} (${oldMessage.author})`, inline: true },
+            { name: 'Channel', value: `${oldMessage.channel}`, inline: true },
+            { name: 'Jump to Message', value: `[Click Here](${newMessage.url})`, inline: true },
+            { name: 'Before', value: oldMessage.content ? `\`\`\`${oldMessage.content.slice(0, 450)}\`\`\`` : '*[Empty]*' },
+            { name: 'After', value: newMessage.content ? `\`\`\`${newMessage.content.slice(0, 450)}\`\`\`` : '*[Empty]*' }
+        )
+        .setTimestamp();
+
+    await logChannel.send({ embeds: [embed] }).catch(() => null);
 });
 
+// ج) تغيير الأحداث الصوتية (Voice Logs)
 client.on('voiceStateUpdate', async (oldState, newState) => {
     const logChannel = await getLogChannel(newState.guild);
     if (!logChannel) return;
 
     const member = newState.member;
+    if (member.user.bot) return;
 
     const getAdminExecutor = async () => {
         try {
@@ -542,26 +635,60 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
             });
             const logEntry = fetchedLogs.entries.first();
             if (logEntry && logEntry.target.id === member.id && (Date.now() - logEntry.createdTimestamp) < 5000) {
-                return logEntry.executor.tag;
+                return `${logEntry.executor.tag} (${logEntry.executor})`;
             }
         } catch (e) {}
-        return 'غير معروف/إداري';
+        return 'Admin / Server';
     };
 
+    // ميوت وفك ميوت فويس
     if (!oldState.serverMute && newState.serverMute) {
         const admin = await getAdminExecutor();
-        await logChannel.send(`🎙️🔇 **ميوت فويس إداري:**\n• **العضو المستهدف:** ${member.user.tag} (${member})\n• **بواسطة الادمن:** ${admin}`);
+        const embed = new EmbedBuilder()
+            .setTitle('🎙️🔇 Server Mute Added')
+            .setColor(0x2F3542)
+            .addFields(
+                { name: 'User', value: `${member.user.tag} (${member})`, inline: true },
+                { name: 'Moderator', value: admin, inline: true }
+            )
+            .setTimestamp();
+        await logChannel.send({ embeds: [embed] });
     } else if (oldState.serverMute && !newState.serverMute) {
         const admin = await getAdminExecutor();
-        await logChannel.send(`🎙️🔊 **فك ميوت فويس إداري:**\n• **العضو:** ${member.user.tag} (${member})\n• **بواسطة الادمن:** ${admin}`);
+        const embed = new EmbedBuilder()
+            .setTitle('🎙️🔊 Server Mute Removed')
+            .setColor(0x2ED573)
+            .addFields(
+                { name: 'User', value: `${member.user.tag} (${member})`, inline: true },
+                { name: 'Moderator', value: admin, inline: true }
+            )
+            .setTimestamp();
+        await logChannel.send({ embeds: [embed] });
     }
 
+    // ديفن وفك ديفن
     if (!oldState.serverDeafen && newState.serverDeafen) {
         const admin = await getAdminExecutor();
-        await logChannel.send(`🎧🔇 **إسكات سماعات إداري:**\n• **العضو:** ${member.user.tag} (${member})\n• **بواسطة الادمن:** ${admin}`);
+        const embed = new EmbedBuilder()
+            .setTitle('🎧🔇 Server Deafen Added')
+            .setColor(0x2F3542)
+            .addFields(
+                { name: 'User', value: `${member.user.tag} (${member})`, inline: true },
+                { name: 'Moderator', value: admin, inline: true }
+            )
+            .setTimestamp();
+        await logChannel.send({ embeds: [embed] });
     } else if (oldState.serverDeafen && !newState.serverDeafen) {
         const admin = await getAdminExecutor();
-        await logChannel.send(`🎧🔊 **فك إسكات السماعات:**\n• **العضو:** ${member.user.tag} (${member})\n• **بواسطة الادمن:** ${admin}`);
+        const embed = new EmbedBuilder()
+            .setTitle('🎧🔊 Server Deafen Removed')
+            .setColor(0x2ED573)
+            .addFields(
+                { name: 'User', value: `${member.user.tag} (${member})`, inline: true },
+                { name: 'Moderator', value: admin, inline: true }
+            )
+            .setTimestamp();
+        await logChannel.send({ embeds: [embed] });
     }
 });
 
