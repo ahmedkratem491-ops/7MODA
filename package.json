@@ -11,6 +11,7 @@
     "discord.js": "latest",
     "express": "latest",
     "sodium-native": "latest",
-    "libsodium-wrappers": "latest"
+    "libsodium-wrappers": "latest", 
+    "play-dl": "^1.9.7"
   }
 }
