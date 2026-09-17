@@ -14,9 +14,14 @@ const {
 const { 
     joinVoiceChannel, 
     getVoiceConnection, 
-    VoiceConnectionStatus 
+    VoiceConnectionStatus,
+    createAudioPlayer,
+    createAudioResource,
+    AudioPlayerStatus,
+    NoSubscriberBehavior
 } = require('@discordjs/voice');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { GoogleGenAI } = require('@google/genai');
+const play = require('play-dl');
 
 // --- 1. خادم HTTP لإبقاء البوت شغال على Render ---
 const app = express();
@@ -26,9 +31,7 @@ app.listen(port, () => console.log(`Server is running on port ${port}`));
 
 // --- 2. إعداد الـ AI والبوت والـ Intents ---
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-// استخدام نموذج gemini-1.5-flash المستقر
-const aiModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 const client = new Client({
     intents: [
@@ -40,11 +43,12 @@ const client = new Client({
     ]
 });
 
-// قواعد البيانات في الذاكرة
+// قواعد البيانات وطوابير التشغيل في الذاكرة
 const warningsDB = new Map(); 
 const logChannelsDB = new Map();
 const autoChatSettings = new Map(); 
 const afkVoiceChannels = new Map(); 
+const musicQueue = new Map(); // طابور الموسيقى لكل سيرفر
 let autoChatInterval = null;
 
 const TOKEN = process.env.DISCORD_TOKEN || '';
@@ -145,6 +149,24 @@ const commands = [
                 .setRequired(false)
         ),
 
+    // --- أوامر التشغيل الصوتي (YouTube) ---
+    new SlashCommandBuilder()
+        .setName('play')
+        .setDescription('تشغيل أي أغنية أو فيديو من يوتيوب')
+        .addStringOption(opt => 
+            opt.setName('query')
+                .setDescription('اسم الأغنية أو رابط الفيديو من يوتيوب')
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('skip')
+        .setDescription('تخطي الأغنية أو المقطع الحالي'),
+
+    new SlashCommandBuilder()
+        .setName('stop')
+        .setDescription('إيقاف التشغيل وتفريغ القائمة وإخراج البوت'),
+
     new SlashCommandBuilder()
         .setName('warn')
         .setDescription('تحذير عضو وتسجيل التحذير فقط دون تايم أوت')
@@ -224,9 +246,11 @@ client.once('ready', async () => {
                     const channel = await guild.channels.fetch(config.channelId).catch(() => null);
                     if (!channel) continue;
 
-                    const prompt = "اكتب رسالة قصيرة، لطيفة وتفاعلية للدردشة مع الأعضاء في السيرفر لفتح موضوع نقاش جانبي مسلي.";
-                    const result = await aiModel.generateContent(prompt);
-                    await channel.send(result.response.text());
+                    const response = await ai.models.generateContent({
+                        model: 'gemini-2.5-flash',
+                        contents: "اكتب رسالة قصيرة، لطيفة وتفاعلية للدردشة مع الأعضاء في السيرفر لفتح موضوع نقاش جانبي مسلي."
+                    });
+                    await channel.send(response.text);
                 } catch (e) {
                     console.error('خطأ في الـ Auto-Chat:', e);
                 }
@@ -297,7 +321,121 @@ client.on('interactionCreate', async (interaction) => {
         }
     }
 
-    // أمر التحذير (بدون تايم أوت تلقائي)
+    // --- معالجة أمر التشغيل /play ---
+    if (commandName === 'play') {
+        const query = options.getString('query');
+        const voiceChannel = interaction.member.voice?.channel;
+
+        if (!voiceChannel) {
+            return interaction.reply({ content: '❌ يجب أن تكون متواجداً في روم صوتي أولاً!', flags: MessageFlags.Ephemeral });
+        }
+
+        await interaction.deferReply();
+
+        try {
+            const searchResults = await play.search(query, { limit: 1 });
+            if (!searchResults || searchResults.length === 0) {
+                return interaction.editReply('❌ لم يتم العثور على أي نتائج لهذا البحث في يوتيوب.');
+            }
+
+            const video = searchResults[0];
+            const song = {
+                title: video.title,
+                url: video.url,
+                duration: video.durationRaw,
+                thumbnail: video.thumbnails[0]?.url
+            };
+
+            let serverQueue = musicQueue.get(guild.id);
+
+            if (!serverQueue) {
+                const queueConstruct = {
+                    textChannel: interaction.channel,
+                    voiceChannel: voiceChannel,
+                    connection: null,
+                    player: createAudioPlayer({
+                        behaviors: { noSubscriber: NoSubscriberBehavior.Play }
+                    }),
+                    songs: [],
+                    playing: true
+                };
+
+                musicQueue.set(guild.id, queueConstruct);
+                queueConstruct.songs.push(song);
+
+                try {
+                    const connection = joinVoiceChannel({
+                        channelId: voiceChannel.id,
+                        guildId: guild.id,
+                        adapterCreator: guild.voiceAdapterCreator,
+                    });
+
+                    queueConstruct.connection = connection;
+                    connection.subscribe(queueConstruct.player);
+
+                    queueConstruct.player.on(AudioPlayerStatus.Idle, () => {
+                        queueConstruct.songs.shift();
+                        playSong(guild, queueConstruct.songs[0]);
+                    });
+
+                    playSong(guild, queueConstruct.songs[0]);
+
+                    const embed = new EmbedBuilder()
+                        .setTitle('🎵 جاري التشغيل')
+                        .setDescription(`[${song.title}](${song.url})`)
+                        .addFields(
+                            { name: 'المدة', value: song.duration || 'غير معروف', inline: true },
+                            { name: 'القناة الصوتية', value: `${voiceChannel}`, inline: true }
+                        )
+                        .setThumbnail(song.thumbnail)
+                        .setColor(0x1DB954);
+
+                    await interaction.editReply({ embeds: [embed] });
+                } catch (err) {
+                    console.error(err);
+                    musicQueue.delete(guild.id);
+                    return interaction.editReply('❌ تعذر الاتصال بالروم الصوتي!');
+                }
+            } else {
+                serverQueue.songs.push(song);
+                const embed = new EmbedBuilder()
+                    .setTitle('🎶 تم الإضافة إلى قائمة الانتظار')
+                    .setDescription(`[${song.title}](${song.url})`)
+                    .addFields({ name: 'المدة', value: song.duration || 'غير معروف', inline: true })
+                    .setThumbnail(song.thumbnail)
+                    .setColor(0xF1C40F);
+
+                return interaction.editReply({ embeds: [embed] });
+            }
+        } catch (error) {
+            console.error(error);
+            await interaction.editReply('❌ حدث خطأ أثناء جلب الفيديو من يوتيوب.');
+        }
+    }
+
+    // --- معالجة أمر التخطي /skip ---
+    if (commandName === 'skip') {
+        const serverQueue = musicQueue.get(guild.id);
+        if (!serverQueue) return interaction.reply({ content: '❌ لا يوجد شيء يشتغل حالياً للتخطي!', flags: MessageFlags.Ephemeral });
+        if (!interaction.member.voice?.channel) return interaction.reply({ content: '❌ يجب أن تكون في الروم الصوتي لاستخدام هذا الأمر!', flags: MessageFlags.Ephemeral });
+
+        serverQueue.player.stop();
+        return interaction.reply('⏭️ تم تخطي المقطع الحالي.');
+    }
+
+    // --- معالجة أمر الإيقاف /stop ---
+    if (commandName === 'stop') {
+        const serverQueue = musicQueue.get(guild.id);
+        if (!serverQueue) return interaction.reply({ content: '❌ البوت لا يشغل أي شيء حالياً!', flags: MessageFlags.Ephemeral });
+
+        serverQueue.songs = [];
+        serverQueue.player.stop();
+        if (serverQueue.connection) serverQueue.connection.destroy();
+        musicQueue.delete(guild.id);
+
+        return interaction.reply('⏹️ تم إيقاف التشغيل وتفريغ القائمة وإخراج البوت.');
+    }
+
     if (commandName === 'warn') {
         const targetUser = options.getUser('user');
         const reason = options.getString('reason') || 'لا يوجد سبب محدد';
@@ -306,7 +444,6 @@ client.on('interactionCreate', async (interaction) => {
         const userWarns = warningsDB.get(targetUser.id);
         const warnId = userWarns.length + 1;
 
-        // تاريخ بتنسيق الأرقام واللغة الإنجليزية
         const formattedDate = new Date().toLocaleString('en-US', {
             year: 'numeric',
             month: '2-digit',
@@ -336,7 +473,6 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.reply({ content: `✅ تم تحذير ${targetUser.tag} برقم (#${warnId}).`, flags: MessageFlags.Ephemeral });
     }
 
-    // أمر التاريخ (تنسيق أنيق بأرقام عادية)
     if (commandName === 'history') {
         const targetUser = options.getUser('user');
         const userWarns = warningsDB.get(targetUser.id) || [];
@@ -354,7 +490,7 @@ client.on('interactionCreate', async (interaction) => {
 
         userWarns.forEach(w => {
             embed.addFields({
-                name: `Warn #${w.id} - ${w.date}`,
+                name: `Warn #${w.id} -${w.date}`,
                 value: `**Reason:** ${w.reason}\n**By:** ${w.moderator}`
             });
         });
@@ -532,9 +668,11 @@ client.on('messageCreate', async (message) => {
     if (isFormMessage) {
         try {
             await message.channel.sendTyping();
-            const prompt = `أنت بوت سيرفر ديسكورد. قم بكتابة رد مشجع ومادح ولطيف جداً لشخص قام للتو بتعبئة وإرسال نموذج أو فورم في السيرفر.`;
-            const result = await aiModel.generateContent(prompt);
-            await message.reply(result.response.text());
+            const response = await ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: "أنت بوت سيرفر ديسكورد. قم بكتابة رد مشجع ومادح ولطيف جداً لشخص قام للتو بتعبئة وإرسال نموذج أو فورم في السيرفر."
+            });
+            await message.reply(response.text);
             return;
         } catch (e) {
             console.error('خطأ في الرد على الفورم:', e);
@@ -547,8 +685,11 @@ client.on('messageCreate', async (message) => {
 
         try {
             await message.channel.sendTyping();
-            const result = await aiModel.generateContent(prompt);
-            const responseText = result.response.text();
+            const response = await ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: prompt
+            });
+            const responseText = response.text;
 
             if (responseText.length > 2000) {
                 await message.reply(responseText.slice(0, 1990) + '...');
@@ -557,14 +698,13 @@ client.on('messageCreate', async (message) => {
             }
         } catch (error) {
             console.error('خطأ في الـ AI:', error);
-            await message.reply('❌ تعذر الاتصال بالذكاء الاصطناعي حالياً. يرجى التأكد من إعداد مفتاح `GEMINI_API_KEY` في إعدادات Render بشكل صحيح.');
+            await message.reply('❌ تعذر الاتصال بالذكاء الاصطناعي حالياً. يرجى التأكد من إعداد مفتاح `GEMINI_API_KEY` بشكل صحيح.');
         }
     }
 });
 
-// --- 7. سجلات اللوغ الاحترافية (Sapphire Style Log System) ---
+// --- 7. سجلات اللوغ الاحترافية ---
 
-// أ) حذف الرسائل
 client.on('messageDelete', async (message) => {
     if (message.author?.bot || !message.guild) return;
     const logChannel = await getLogChannel(message.guild);
@@ -596,7 +736,6 @@ client.on('messageDelete', async (message) => {
     await logChannel.send({ embeds: [embed] }).catch(() => null);
 });
 
-// ب) تعديل الرسائل
 client.on('messageUpdate', async (oldMessage, newMessage) => {
     if (oldMessage.author?.bot || !oldMessage.guild) return;
     if (oldMessage.content === newMessage.content) return;
@@ -619,7 +758,6 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
     await logChannel.send({ embeds: [embed] }).catch(() => null);
 });
 
-// ج) تغيير الأحداث الصوتية (Voice Logs)
 client.on('voiceStateUpdate', async (oldState, newState) => {
     const logChannel = await getLogChannel(newState.guild);
     if (!logChannel) return;
@@ -641,7 +779,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         return 'Admin / Server';
     };
 
-    // ميوت وفك ميوت فويس
     if (!oldState.serverMute && newState.serverMute) {
         const admin = await getAdminExecutor();
         const embed = new EmbedBuilder()
@@ -666,7 +803,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         await logChannel.send({ embeds: [embed] });
     }
 
-    // ديفن وفك ديفن
     if (!oldState.serverDeafen && newState.serverDeafen) {
         const admin = await getAdminExecutor();
         const embed = new EmbedBuilder()
@@ -691,5 +827,35 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         await logChannel.send({ embeds: [embed] });
     }
 });
+
+// --- 8. دالة بث الصوت المساعد (playSong) ---
+async function playSong(guild, song) {
+    const serverQueue = musicQueue.get(guild.id);
+    if (!song) {
+        if (serverQueue.connection) serverQueue.connection.destroy();
+        musicQueue.delete(guild.id);
+        return;
+    }
+
+    try {
+        const stream = await play.stream(song.url, { quality: 2 });
+        const resource = createAudioResource(stream.stream, {
+            inputType: stream.type
+        });
+
+        serverQueue.player.play(resource);
+
+        const embed = new EmbedBuilder()
+            .setTitle('▶️ تم التشغيل')
+            .setDescription(`[${song.title}](${song.url})`)
+            .setColor(0x2ECC71);
+
+        serverQueue.textChannel.send({ embeds: [embed] });
+    } catch (error) {
+        console.error('خطأ في تشغيل المقطع:', error);
+        serverQueue.songs.shift();
+        playSong(guild, serverQueue.songs[0]);
+    }
+}
 
 client.login(TOKEN);
