@@ -6,12 +6,14 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@discordjs/opus": "^0.9.0",
     "@discordjs/voice": "latest",
     "@google/genai": "latest",
     "discord.js": "latest",
     "express": "latest",
-    "sodium-native": "latest",
+    "ffmpeg-static": "^5.2.0",
     "libsodium-wrappers": "latest",
-    "play-dl": "^1.9.7"
+    "play-dl": "^1.9.7",
+    "sodium-native": "latest"
   }
 }
