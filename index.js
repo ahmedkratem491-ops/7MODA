@@ -29,9 +29,18 @@ const port = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('Bot is online!'));
 app.listen(port, () => console.log(`Server is running on port ${port}`));
 
-// --- 2. إعداد الـ AI والبوت والـ Intents ---
+// --- 2. إعداد الـ AI والبوت والـ Cookies ---
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+// ضبط كوكيز يوتيوب لتجاوز حظر Render من خلال متغيرات البيئة
+if (process.env.YOUTUBE_COOKIE) {
+    play.setToken({
+        youtube: {
+            cookie: process.env.YOUTUBE_COOKIE
+        }
+    });
+}
 
 const client = new Client({
     intents: [
@@ -223,7 +232,7 @@ const commands = [
 ].map(cmd => cmd.toJSON());
 
 // --- 4. تسجيل الأوامر والدردشة التلقائية ---
-client.once('ready', async () => {
+client.once('clientReady', async () => {
     console.log(`✅ تم تشغيل البوت بنجاح باسم: ${client.user.tag}`);
     const rest = new REST({ version: '10' }).setToken(TOKEN || client.token);
     try {
@@ -368,12 +377,20 @@ client.on('interactionCreate', async (interaction) => {
                         channelId: voiceChannel.id,
                         guildId: guild.id,
                         adapterCreator: guild.voiceAdapterCreator,
+                        selfDeaf: false,
+                        selfMute: false
                     });
 
                     queueConstruct.connection = connection;
                     connection.subscribe(queueConstruct.player);
 
                     queueConstruct.player.on(AudioPlayerStatus.Idle, () => {
+                        queueConstruct.songs.shift();
+                        playSong(guild, queueConstruct.songs[0]);
+                    });
+
+                    queueConstruct.player.on('error', error => {
+                        console.error('حدث خطأ في التشغيل الصوتي:', error.message);
                         queueConstruct.songs.shift();
                         playSong(guild, queueConstruct.songs[0]);
                     });
@@ -413,7 +430,6 @@ client.on('interactionCreate', async (interaction) => {
         }
     }
 
-    // --- معالجة أمر التخطي /skip ---
     if (commandName === 'skip') {
         const serverQueue = musicQueue.get(guild.id);
         if (!serverQueue) return interaction.reply({ content: '❌ لا يوجد شيء يشتغل حالياً للتخطي!', flags: MessageFlags.Ephemeral });
@@ -423,7 +439,6 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply('⏭️ تم تخطي المقطع الحالي.');
     }
 
-    // --- معالجة أمر الإيقاف /stop ---
     if (commandName === 'stop') {
         const serverQueue = musicQueue.get(guild.id);
         if (!serverQueue) return interaction.reply({ content: '❌ البوت لا يشغل أي شيء حالياً!', flags: MessageFlags.Ephemeral });
@@ -698,7 +713,7 @@ client.on('messageCreate', async (message) => {
             }
         } catch (error) {
             console.error('خطأ في الـ AI:', error);
-            await message.reply('❌ تعذر الاتصال بالذكاء الاصطناعي حالياً. يرجى التأكد من إعداد مفتاح `GEMINI_API_KEY` بشكل صحيح.');
+            await message.reply('❌ تعذر الاتصال بالذكاء الاصطناعي حالياً.');
         }
     }
 });
@@ -821,7 +836,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
             .setColor(0x2ED573)
             .addFields(
                 { name: 'User', value: `${member.user.tag} (${member})`, inline: true },
-                { name: 'Moderator', value: admin, inline: true }
+                { name: 'Moderator', value: `${admin}`, inline: true }
             )
             .setTimestamp();
         await logChannel.send({ embeds: [embed] });
@@ -838,7 +853,7 @@ async function playSong(guild, song) {
     }
 
     try {
-        const stream = await play.stream(song.url, { quality: 2 });
+        const stream = await play.stream(song.url);
         const resource = createAudioResource(stream.stream, {
             inputType: stream.type
         });
@@ -846,7 +861,7 @@ async function playSong(guild, song) {
         serverQueue.player.play(resource);
 
         const embed = new EmbedBuilder()
-            .setTitle('▶️ تم التشغيل')
+            .setTitle('▶️ الآن يعزف')
             .setDescription(`[${song.title}](${song.url})`)
             .setColor(0x2ECC71);
 
