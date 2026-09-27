@@ -1,4 +1,5 @@
 const express = require('express');
+const fs = require('fs');
 const { 
     Client, 
     GatewayIntentBits, 
@@ -52,13 +53,46 @@ const client = new Client({
     ]
 });
 
-// قواعد البيانات وطوابير التشغيل في الذاكرة
-const warningsDB = new Map(); 
+// --- قواعد البيانات (تحفظ بملف JSON عشان ما تضيع عند إعادة التشغيل) ---
+const DATA_FILE = './bot_data.json';
+
+const warningsDB = new Map();
 const logChannelsDB = new Map();
-const autoChatSettings = new Map(); 
-const afkVoiceChannels = new Map(); 
-const musicQueue = new Map(); // طابور الموسيقى لكل سيرفر
+const autoChatSettings = new Map();
+const afkVoiceChannels = new Map();
+const musicQueue = new Map(); // لا يُحفظ بالملف، مؤقت بالذاكرة فقط
 let autoChatInterval = null;
+
+function saveData() {
+    try {
+        const data = {
+            warnings: Array.from(warningsDB.entries()),
+            logChannels: Array.from(logChannelsDB.entries()),
+            autoChat: Array.from(autoChatSettings.entries()),
+            afkVoice: Array.from(afkVoiceChannels.entries())
+        };
+        fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+    } catch (e) {
+        console.error('خطأ في حفظ البيانات:', e);
+    }
+}
+
+function loadData() {
+    try {
+        if (!fs.existsSync(DATA_FILE)) return;
+        const raw = fs.readFileSync(DATA_FILE, 'utf-8');
+        const data = JSON.parse(raw);
+
+        (data.warnings || []).forEach(([key, value]) => warningsDB.set(key, value));
+        (data.logChannels || []).forEach(([key, value]) => logChannelsDB.set(key, value));
+        (data.autoChat || []).forEach(([key, value]) => autoChatSettings.set(key, value));
+        (data.afkVoice || []).forEach(([key, value]) => afkVoiceChannels.set(key, value));
+
+        console.log('✅ تم تحميل البيانات المحفوظة بنجاح.');
+    } catch (e) {
+        console.error('خطأ في تحميل البيانات:', e);
+    }
+}
 
 const TOKEN = process.env.DISCORD_TOKEN || '';
 
@@ -158,7 +192,7 @@ const commands = [
                 .setRequired(false)
         ),
 
-    // --- أوامر التشغيل الصوتي (YouTube) ---
+    // --- أوامر الموسيقى ---
     new SlashCommandBuilder()
         .setName('play')
         .setDescription('تشغيل أي أغنية أو فيديو من يوتيوب')
@@ -175,6 +209,51 @@ const commands = [
     new SlashCommandBuilder()
         .setName('stop')
         .setDescription('إيقاف التشغيل وتفريغ القائمة وإخراج البوت'),
+
+    new SlashCommandBuilder()
+        .setName('pause')
+        .setDescription('إيقاف الأغنية الحالية مؤقتاً'),
+
+    new SlashCommandBuilder()
+        .setName('resume')
+        .setDescription('استئناف تشغيل الأغنية بعد الإيقاف المؤقت'),
+
+    new SlashCommandBuilder()
+        .setName('volume')
+        .setDescription('ضبط مستوى صوت التشغيل')
+        .addIntegerOption(opt =>
+            opt.setName('level')
+                .setDescription('المستوى من 0 إلى 150')
+                .setMinValue(0)
+                .setMaxValue(150)
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('loop')
+        .setDescription('تكرار الأغنية الحالية أو كل القائمة')
+        .addStringOption(opt =>
+            opt.setName('mode')
+                .setDescription('وضع التكرار')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'إيقاف التكرار', value: 'off' },
+                    { name: 'تكرار الأغنية الحالية', value: 'song' },
+                    { name: 'تكرار القائمة كاملة', value: 'queue' }
+                )
+        ),
+
+    new SlashCommandBuilder()
+        .setName('queue')
+        .setDescription('عرض قائمة التشغيل الحالية'),
+
+    new SlashCommandBuilder()
+        .setName('nowplaying')
+        .setDescription('عرض الأغنية الشغالة حالياً'),
+
+    new SlashCommandBuilder()
+        .setName('help')
+        .setDescription('عرض كل أوامر البوت'),
 
     new SlashCommandBuilder()
         .setName('warn')
@@ -231,7 +310,7 @@ const commands = [
         .addStringOption(opt => opt.setName('user_id').setDescription('آيدي العضو المحظور').setRequired(true))
 ].map(cmd => cmd.toJSON());
 
-// --- 4. تسجيل الأوامر والدردشة التلقائية ---
+// --- 4. تسجيل الأوامر والدردشة التلقائية والاتصال التلقائي بالرومات ---
 client.once('clientReady', async () => {
     console.log(`✅ تم تشغيل البوت بنجاح باسم: ${client.user.tag}`);
     const rest = new REST({ version: '10' }).setToken(TOKEN || client.token);
@@ -243,6 +322,16 @@ client.once('clientReady', async () => {
         console.log('✅ تم تسجيل جميع أوامر السلاش بنجاح!');
     } catch (error) {
         console.error('خطأ أثناء تسجيل الأوامر:', error);
+    }
+
+    // إعادة الاتصال التلقائي برومات الـ AFK بعد إعادة تشغيل البوت
+    for (const [guildId, channelId] of afkVoiceChannels.entries()) {
+        try {
+            const guild = await client.guilds.fetch(guildId).catch(() => null);
+            if (guild) connectToAfkVoice(guild, channelId);
+        } catch (e) {
+            console.error('خطأ في إعادة الاتصال بروم AFK:', e);
+        }
     }
 
     if (!autoChatInterval) {
@@ -284,6 +373,7 @@ client.on('interactionCreate', async (interaction) => {
     if (commandName === 'log') {
         const selectedChannel = options.getChannel('channel');
         logChannelsDB.set(guild.id, selectedChannel.id);
+        saveData();
 
         const embed = new EmbedBuilder()
             .setTitle('⚙️ Log Channel Set')
@@ -304,9 +394,11 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.reply({ content: '❌ يجب اختيار القناة النصية المراد التحدث فيها عند التفعيل!', flags: MessageFlags.Ephemeral });
             }
             autoChatSettings.set(guild.id, { enabled: true, channelId: channel.id });
+            saveData();
             return interaction.reply({ content: `✅ تم تفعيل الدردشة التلقائية كل 30 دقيقة في ${channel}.`, flags: MessageFlags.Ephemeral });
         } else {
             autoChatSettings.set(guild.id, { enabled: false, channelId: null });
+            saveData();
             return interaction.reply({ content: `🛑 تم إيقاف الدردشة التلقائية.`, flags: MessageFlags.Ephemeral });
         }
     }
@@ -320,12 +412,14 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.reply({ content: '❌ يجب تحديد القناة الصوتية المراد البقاء فيها!', flags: MessageFlags.Ephemeral });
             }
             afkVoiceChannels.set(guild.id, channel.id);
+            saveData();
             connectToAfkVoice(guild, channel.id);
             return interaction.reply({ content: `🎙️✅ تم دخول الروم الصوتي ${channel} وسيظل البوت متواجداً فيه 24/7.`, flags: MessageFlags.Ephemeral });
         } else {
             const connection = getVoiceConnection(guild.id);
             if (connection) connection.destroy();
             afkVoiceChannels.delete(guild.id);
+            saveData();
             return interaction.reply({ content: `🔴 تم خروج البوت من الروم الصوتي وتفكيك التواجد الدائم.`, flags: MessageFlags.Ephemeral });
         }
     }
@@ -342,17 +436,24 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.deferReply();
 
         try {
-            const searchResults = await play.search(query, { limit: 1 });
-            if (!searchResults || searchResults.length === 0) {
-                return interaction.editReply('❌ لم يتم العثور على أي نتائج لهذا البحث في يوتيوب.');
+            let video;
+            if (play.yt_validate(query) === 'video') {
+                const info = await play.video_basic_info(query);
+                video = info.video_details;
+            } else {
+                const searchResults = await play.search(query, { limit: 1, source: { youtube: 'video' } });
+                if (!searchResults || searchResults.length === 0) {
+                    return interaction.editReply('❌ لم يتم العثور على أي نتائج لهذا البحث في يوتيوب.');
+                }
+                video = searchResults[0];
             }
 
-            const video = searchResults[0];
             const song = {
                 title: video.title,
                 url: video.url,
                 duration: video.durationRaw,
-                thumbnail: video.thumbnails[0]?.url
+                thumbnail: video.thumbnails?.[0]?.url,
+                requestedBy: interaction.user.tag
             };
 
             let serverQueue = musicQueue.get(guild.id);
@@ -365,7 +466,10 @@ client.on('interactionCreate', async (interaction) => {
                     player: createAudioPlayer({
                         behaviors: { noSubscriber: NoSubscriberBehavior.Play }
                     }),
+                    resource: null,
                     songs: [],
+                    volume: 100,
+                    loop: 'off', // off | song | queue
                     playing: true
                 };
 
@@ -385,7 +489,16 @@ client.on('interactionCreate', async (interaction) => {
                     connection.subscribe(queueConstruct.player);
 
                     queueConstruct.player.on(AudioPlayerStatus.Idle, () => {
-                        queueConstruct.songs.shift();
+                        const finished = queueConstruct.songs[0];
+                        if (queueConstruct.loop === 'song' && finished) {
+                            // نفس الأغنية تعاد بدون حذفها من المقدمة
+                            playSong(guild, finished);
+                            return;
+                        }
+                        const justPlayed = queueConstruct.songs.shift();
+                        if (queueConstruct.loop === 'queue' && justPlayed) {
+                            queueConstruct.songs.push(justPlayed);
+                        }
                         playSong(guild, queueConstruct.songs[0]);
                     });
 
@@ -402,7 +515,8 @@ client.on('interactionCreate', async (interaction) => {
                         .setDescription(`[${song.title}](${song.url})`)
                         .addFields(
                             { name: 'المدة', value: song.duration || 'غير معروف', inline: true },
-                            { name: 'القناة الصوتية', value: `${voiceChannel}`, inline: true }
+                            { name: 'القناة الصوتية', value: `${voiceChannel}`, inline: true },
+                            { name: 'طلب بواسطة', value: song.requestedBy, inline: true }
                         )
                         .setThumbnail(song.thumbnail)
                         .setColor(0x1DB954);
@@ -418,7 +532,10 @@ client.on('interactionCreate', async (interaction) => {
                 const embed = new EmbedBuilder()
                     .setTitle('🎶 تم الإضافة إلى قائمة الانتظار')
                     .setDescription(`[${song.title}](${song.url})`)
-                    .addFields({ name: 'المدة', value: song.duration || 'غير معروف', inline: true })
+                    .addFields(
+                        { name: 'المدة', value: song.duration || 'غير معروف', inline: true },
+                        { name: 'الترتيب في القائمة', value: `#${serverQueue.songs.length}`, inline: true }
+                    )
                     .setThumbnail(song.thumbnail)
                     .setColor(0xF1C40F);
 
@@ -435,6 +552,8 @@ client.on('interactionCreate', async (interaction) => {
         if (!serverQueue) return interaction.reply({ content: '❌ لا يوجد شيء يشتغل حالياً للتخطي!', flags: MessageFlags.Ephemeral });
         if (!interaction.member.voice?.channel) return interaction.reply({ content: '❌ يجب أن تكون في الروم الصوتي لاستخدام هذا الأمر!', flags: MessageFlags.Ephemeral });
 
+        // نلغي وضع تكرار الأغنية مؤقتاً عشان السكيب يشتغل صح
+        if (serverQueue.loop === 'song') serverQueue.loop = 'off';
         serverQueue.player.stop();
         return interaction.reply('⏭️ تم تخطي المقطع الحالي.');
     }
@@ -444,11 +563,109 @@ client.on('interactionCreate', async (interaction) => {
         if (!serverQueue) return interaction.reply({ content: '❌ البوت لا يشغل أي شيء حالياً!', flags: MessageFlags.Ephemeral });
 
         serverQueue.songs = [];
+        serverQueue.loop = 'off';
         serverQueue.player.stop();
         if (serverQueue.connection) serverQueue.connection.destroy();
         musicQueue.delete(guild.id);
 
         return interaction.reply('⏹️ تم إيقاف التشغيل وتفريغ القائمة وإخراج البوت.');
+    }
+
+    if (commandName === 'pause') {
+        const serverQueue = musicQueue.get(guild.id);
+        if (!serverQueue || !serverQueue.songs.length) {
+            return interaction.reply({ content: '❌ لا يوجد شيء يشتغل حالياً!', flags: MessageFlags.Ephemeral });
+        }
+        const paused = serverQueue.player.pause();
+        return interaction.reply(paused ? '⏸️ تم إيقاف التشغيل مؤقتاً.' : '❌ التشغيل متوقف بالفعل.');
+    }
+
+    if (commandName === 'resume') {
+        const serverQueue = musicQueue.get(guild.id);
+        if (!serverQueue || !serverQueue.songs.length) {
+            return interaction.reply({ content: '❌ لا يوجد شيء يشتغل حالياً!', flags: MessageFlags.Ephemeral });
+        }
+        const resumed = serverQueue.player.unpause();
+        return interaction.reply(resumed ? '▶️ تم استئناف التشغيل.' : '❌ التشغيل شغال بالفعل.');
+    }
+
+    if (commandName === 'volume') {
+        const serverQueue = musicQueue.get(guild.id);
+        const level = options.getInteger('level');
+        if (!serverQueue) {
+            return interaction.reply({ content: '❌ لا يوجد شيء يشتغل حالياً!', flags: MessageFlags.Ephemeral });
+        }
+        serverQueue.volume = level;
+        if (serverQueue.resource?.volume) {
+            serverQueue.resource.volume.setVolume(level / 100);
+        }
+        return interaction.reply(`🔊 تم ضبط مستوى الصوت على ${level}%.`);
+    }
+
+    if (commandName === 'loop') {
+        const serverQueue = musicQueue.get(guild.id);
+        const mode = options.getString('mode');
+        if (!serverQueue) {
+            return interaction.reply({ content: '❌ لا يوجد شيء يشتغل حالياً!', flags: MessageFlags.Ephemeral });
+        }
+        serverQueue.loop = mode;
+        const labels = { off: 'إيقاف التكرار', song: 'تكرار الأغنية الحالية', queue: 'تكرار القائمة كاملة' };
+        return interaction.reply(`🔁 تم ضبط وضع التكرار: ${labels[mode]}.`);
+    }
+
+    if (commandName === 'queue') {
+        const serverQueue = musicQueue.get(guild.id);
+        if (!serverQueue || !serverQueue.songs.length) {
+            return interaction.reply({ content: 'ℹ️ لا يوجد قائمة تشغيل حالياً.', flags: MessageFlags.Ephemeral });
+        }
+
+        const list = serverQueue.songs
+            .slice(0, 10)
+            .map((s, i) => `${i === 0 ? '▶️' : `${i}.`} [${s.title}](${s.url}) — ${s.duration || '?'}`)
+            .join('\n');
+
+        const embed = new EmbedBuilder()
+            .setTitle('📋 قائمة التشغيل الحالية')
+            .setDescription(list)
+            .setFooter({ text: `الإجمالي: ${serverQueue.songs.length} مقطع | التكرار: ${serverQueue.loop}` })
+            .setColor(0x3498DB);
+
+        return interaction.reply({ embeds: [embed] });
+    }
+
+    if (commandName === 'nowplaying') {
+        const serverQueue = musicQueue.get(guild.id);
+        const current = serverQueue?.songs?.[0];
+        if (!current) {
+            return interaction.reply({ content: 'ℹ️ لا يوجد شيء يشتغل حالياً.', flags: MessageFlags.Ephemeral });
+        }
+
+        const embed = new EmbedBuilder()
+            .setTitle('🎧 الآن يعزف')
+            .setDescription(`[${current.title}](${current.url})`)
+            .addFields(
+                { name: 'المدة', value: current.duration || 'غير معروف', inline: true },
+                { name: 'مستوى الصوت', value: `${serverQueue.volume}%`, inline: true },
+                { name: 'التكرار', value: serverQueue.loop, inline: true }
+            )
+            .setThumbnail(current.thumbnail)
+            .setColor(0x1DB954);
+
+        return interaction.reply({ embeds: [embed] });
+    }
+
+    if (commandName === 'help') {
+        const embed = new EmbedBuilder()
+            .setTitle('📖 قائمة أوامر البوت')
+            .setColor(0x5865F2)
+            .addFields(
+                { name: '🎵 الموسيقى', value: '`/play` `/skip` `/stop` `/pause` `/resume` `/volume` `/loop` `/queue` `/nowplaying`' },
+                { name: '🛡️ الإدارة', value: '`/warn` `/history` `/unwarn` `/timeout` `/untimeout` `/kick` `/ban` `/unban`' },
+                { name: '⚙️ الإعدادات', value: '`/log` `/autochat` `/afkvoice`' }
+            )
+            .setFooter({ text: 'اذكر البوت بأي رسالة عشان يرد عليك بالذكاء الاصطناعي' });
+
+        return interaction.reply({ embeds: [embed] });
     }
 
     if (commandName === 'warn') {
@@ -469,6 +686,7 @@ client.on('interactionCreate', async (interaction) => {
         });
 
         userWarns.push({ id: warnId, reason, moderator: interaction.user.tag, date: formattedDate });
+        saveData();
 
         try { await targetUser.send(`⚠️ **تنبيه:** تلقيت تحذيراً رقم (#${warnId}) في سيرفر **${guild.name}**\n**السبب:** ${reason}`); } catch (e) {}
 
@@ -524,6 +742,7 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         userWarns.splice(index, 1);
+        saveData();
         if (logChannel) {
             const embed = new EmbedBuilder()
                 .setTitle('🟢 Warning Removed')
@@ -847,7 +1066,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 async function playSong(guild, song) {
     const serverQueue = musicQueue.get(guild.id);
     if (!song) {
-        if (serverQueue.connection) serverQueue.connection.destroy();
+        if (serverQueue?.connection) serverQueue.connection.destroy();
         musicQueue.delete(guild.id);
         return;
     }
@@ -855,13 +1074,16 @@ async function playSong(guild, song) {
     try {
         const stream = await play.stream(song.url);
         const resource = createAudioResource(stream.stream, {
-            inputType: stream.type
+            inputType: stream.type,
+            inlineVolume: true
         });
+        resource.volume.setVolume((serverQueue.volume || 100) / 100);
+        serverQueue.resource = resource;
 
         serverQueue.player.play(resource);
 
         const embed = new EmbedBuilder()
-            .setTitle('▶️ الآن يعزف')
+            .setTitle('▶️ الآن يشتغل ')
             .setDescription(`[${song.title}](${song.url})`)
             .setColor(0x2ECC71);
 
@@ -873,4 +1095,9 @@ async function playSong(guild, song) {
     }
 }
 
+// حفظ البيانات عند إيقاف البوت (مثلاً عند إعادة نشر على Render)
+process.on('SIGINT', () => { saveData(); process.exit(0); });
+process.on('SIGTERM', () => { saveData(); process.exit(0); });
+
+loadData();
 client.login(TOKEN);
