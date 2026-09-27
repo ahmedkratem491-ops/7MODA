@@ -448,9 +448,14 @@ client.on('interactionCreate', async (interaction) => {
                 video = searchResults[0];
             }
 
+            const resolvedUrl = video.url || (video.id ? `https://www.youtube.com/watch?v=${video.id}` : null);
+            if (!resolvedUrl) {
+                return interaction.editReply('❌ تعذر الحصول على رابط صالح لهذا الفيديو، جرب فيديو ثاني.');
+            }
+
             const song = {
                 title: video.title,
-                url: video.url,
+                url: resolvedUrl,
                 duration: video.durationRaw,
                 thumbnail: video.thumbnails?.[0]?.url,
                 requestedBy: interaction.user.tag
@@ -1071,6 +1076,12 @@ async function playSong(guild, song) {
         return;
     }
 
+    if (!song.url) {
+        console.error('تخطي مقطع بدون رابط صالح:', song.title);
+        serverQueue.songs.shift();
+        return playSong(guild, serverQueue.songs[0]);
+    }
+
     try {
         const stream = await play.stream(song.url);
         const resource = createAudioResource(stream.stream, {
@@ -1083,7 +1094,7 @@ async function playSong(guild, song) {
         serverQueue.player.play(resource);
 
         const embed = new EmbedBuilder()
-            .setTitle('▶️ الآن يشتغل ')
+            .setTitle('▶️ الآن يعزف')
             .setDescription(`[${song.title}](${song.url})`)
             .setColor(0x2ECC71);
 
