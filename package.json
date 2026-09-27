@@ -13,7 +13,7 @@
     "express": "latest",
     "ffmpeg-static": "^5.2.0",
     "libsodium-wrappers": "latest",
-    "play-dl": "^1.9.7",
-    "sodium-native": "latest"
+    "sodium-native": "latest",
+    "ytdlp-nodejs": "latest"
   }
 }
