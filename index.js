@@ -1,5 +1,7 @@
 const express = require('express');
 const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
 const { 
     Client, 
     GatewayIntentBits, 
@@ -19,10 +21,12 @@ const {
     createAudioPlayer,
     createAudioResource,
     AudioPlayerStatus,
-    NoSubscriberBehavior
+    NoSubscriberBehavior,
+    StreamType
 } = require('@discordjs/voice');
 const { GoogleGenAI } = require('@google/genai');
-const play = require('play-dl');
+const { YtDlp, helpers } = require('ytdlp-nodejs');
+const ffmpegPath = require('ffmpeg-static');
 
 // --- 1. خادم HTTP لإبقاء البوت شغال على Render ---
 const app = express();
@@ -30,17 +34,66 @@ const port = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('Bot is online!'));
 app.listen(port, () => console.log(`Server is running on port ${port}`));
 
-// --- 2. إعداد الـ AI والبوت والـ Cookies ---
+// --- 2. إعداد الـ AI والبوت ومحرك تشغيل يوتيوب (yt-dlp) ---
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-// ضبط كوكيز يوتيوب لتجاوز حظر Render من خلال متغيرات البيئة
+const ytdlp = new YtDlp();
+
+// ضبط كوكيز يوتيوب من متغيرات البيئة (نفس محتوى ملف cookies.txt كما هو، بدون أي تحويل)
+const COOKIES_PATH = path.join(__dirname, 'yt-cookies.txt');
 if (process.env.YOUTUBE_COOKIE) {
-    play.setToken({
-        youtube: {
-            cookie: process.env.YOUTUBE_COOKIE
+    fs.writeFileSync(COOKIES_PATH, process.env.YOUTUBE_COOKIE);
+}
+function cookieArgs() {
+    return fs.existsSync(COOKIES_PATH) ? ['--cookies', COOKIES_PATH] : [];
+}
+
+async function ensureYtDlpReady() {
+    try {
+        const installed = await ytdlp.checkInstallationAsync({ ffmpeg: true }).catch(() => false);
+        if (!installed) {
+            console.log('⏳ جاري تحميل yt-dlp / ffmpeg...');
+            await helpers.downloadYtDlp().catch(e => console.error('فشل تحميل yt-dlp:', e.message));
+            await helpers.downloadFFmpeg().catch(e => console.error('فشل تحميل ffmpeg:', e.message));
         }
+    } catch (e) {
+        console.error('خطأ في التحقق من تثبيت yt-dlp:', e);
+    }
+}
+
+function formatDuration(seconds) {
+    if (seconds === null || seconds === undefined) return null;
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    const mm = String(m).padStart(h > 0 ? 2 : 1, '0');
+    const ss = String(s).padStart(2, '0');
+    return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+}
+
+// يبحث عن فيديو أو يفهم رابط مباشر ويرجع بياناته الأساسية
+async function resolveVideo(query) {
+    const isUrl = /^https?:\/\//i.test(query);
+    const target = isUrl ? query : `ytsearch1:${query}`;
+
+    const info = await ytdlp.getInfoAsync(target, {
+        rawArgs: ['--no-playlist', ...cookieArgs()]
     });
+
+    const video = info?.entries ? info.entries[0] : info;
+    if (!video) return null;
+
+    const videoUrl = video.webpage_url || video.original_url
+        || (video.id ? `https://www.youtube.com/watch?v=${video.id}` : null);
+    if (!videoUrl) return null;
+
+    return {
+        title: video.title || 'بدون عنوان',
+        url: videoUrl,
+        duration: formatDuration(video.duration),
+        thumbnail: video.thumbnail || video.thumbnails?.[video.thumbnails.length - 1]?.url
+    };
 }
 
 const client = new Client({
@@ -313,6 +366,7 @@ const commands = [
 // --- 4. تسجيل الأوامر والدردشة التلقائية والاتصال التلقائي بالرومات ---
 client.once('clientReady', async () => {
     console.log(`✅ تم تشغيل البوت بنجاح باسم: ${client.user.tag}`);
+    await ensureYtDlpReady();
     const rest = new REST({ version: '10' }).setToken(TOKEN || client.token);
     try {
         await rest.put(
@@ -436,28 +490,16 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.deferReply();
 
         try {
-            let video;
-            if (play.yt_validate(query) === 'video') {
-                const info = await play.video_basic_info(query);
-                video = info.video_details;
-            } else {
-                const searchResults = await play.search(query, { limit: 1, source: { youtube: 'video' } });
-                if (!searchResults || searchResults.length === 0) {
-                    return interaction.editReply('❌ لم يتم العثور على أي نتائج لهذا البحث في يوتيوب.');
-                }
-                video = searchResults[0];
-            }
-
-            const resolvedUrl = video.url || (video.id ? `https://www.youtube.com/watch?v=${video.id}` : null);
-            if (!resolvedUrl) {
-                return interaction.editReply('❌ تعذر الحصول على رابط صالح لهذا الفيديو، جرب فيديو ثاني.');
+            const video = await resolveVideo(query);
+            if (!video) {
+                return interaction.editReply('❌ لم يتم العثور على أي نتائج لهذا البحث في يوتيوب.');
             }
 
             const song = {
                 title: video.title,
-                url: resolvedUrl,
-                duration: video.durationRaw,
-                thumbnail: video.thumbnails?.[0]?.url,
+                url: video.url,
+                duration: video.duration,
+                thumbnail: video.thumbnail,
                 requestedBy: interaction.user.tag
             };
 
@@ -559,6 +601,7 @@ client.on('interactionCreate', async (interaction) => {
 
         // نلغي وضع تكرار الأغنية مؤقتاً عشان السكيب يشتغل صح
         if (serverQueue.loop === 'song') serverQueue.loop = 'off';
+        killActiveAudio(serverQueue);
         serverQueue.player.stop();
         return interaction.reply('⏭️ تم تخطي المقطع الحالي.');
     }
@@ -569,6 +612,7 @@ client.on('interactionCreate', async (interaction) => {
 
         serverQueue.songs = [];
         serverQueue.loop = 'off';
+        killActiveAudio(serverQueue);
         serverQueue.player.stop();
         if (serverQueue.connection) serverQueue.connection.destroy();
         musicQueue.delete(guild.id);
@@ -1068,9 +1112,19 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 });
 
 // --- 8. دالة بث الصوت المساعد (playSong) ---
+// يوقف عملية yt-dlp و ffmpeg الحالية (لو موجودة) بدون ما يطيح البوت
+function killActiveAudio(serverQueue) {
+    if (!serverQueue) return;
+    try { serverQueue.ytdlpStream?.destroy?.(); } catch (e) {}
+    try { serverQueue.ffmpegProcess?.kill?.('SIGKILL'); } catch (e) {}
+    serverQueue.ytdlpStream = null;
+    serverQueue.ffmpegProcess = null;
+}
+
 async function playSong(guild, song) {
     const serverQueue = musicQueue.get(guild.id);
     if (!song) {
+        killActiveAudio(serverQueue);
         if (serverQueue?.connection) serverQueue.connection.destroy();
         musicQueue.delete(guild.id);
         return;
@@ -1082,10 +1136,39 @@ async function playSong(guild, song) {
         return playSong(guild, serverQueue.songs[0]);
     }
 
+    killActiveAudio(serverQueue);
+
     try {
-        const stream = await play.stream(song.url);
-        const resource = createAudioResource(stream.stream, {
-            inputType: stream.type,
+        // نجيب الصوت بواسطة yt-dlp ونمرره لـ ffmpeg عشان يحوله لصيغة خام يقدر ديسكورد يشغلها
+        const ytdlpStream = ytdlp
+            .stream(song.url, {
+                format: { filter: 'audioonly', quality: 'highest' },
+                rawArgs: cookieArgs()
+            })
+            .getStream();
+
+        const ffmpegProcess = spawn(ffmpegPath, [
+            '-i', 'pipe:0',
+            '-analyzeduration', '0',
+            '-loglevel', '0',
+            '-f', 's16le',
+            '-ar', '48000',
+            '-ac', '2',
+            'pipe:1'
+        ], { stdio: ['pipe', 'pipe', 'ignore'] });
+
+        // نتجاهل أخطاء الأنابيب (EPIPE) اللي تصير طبيعياً عند السكيب المفاجئ
+        ytdlpStream.on('error', () => {});
+        ffmpegProcess.stdin.on('error', () => {});
+        ffmpegProcess.stdout.on('error', () => {});
+
+        ytdlpStream.pipe(ffmpegProcess.stdin);
+
+        serverQueue.ytdlpStream = ytdlpStream;
+        serverQueue.ffmpegProcess = ffmpegProcess;
+
+        const resource = createAudioResource(ffmpegProcess.stdout, {
+            inputType: StreamType.Raw,
             inlineVolume: true
         });
         resource.volume.setVolume((serverQueue.volume || 100) / 100);
