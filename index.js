@@ -36,8 +36,13 @@ app.listen(port, () => console.log(`Server is running on port ${port}`));
 
 // --- 2. إعداد الـ AI والبوت ومحرك تشغيل يوتيوب (yt-dlp) ---
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+
+// تقدر تضيف أكثر من مفتاح Gemini (من مشاريع مختلفة بنفس حسابك في Google) لتوسيع الحصة اليومية:
+// GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3 ... إلخ في متغيرات البيئة
+const GEMINI_KEYS = [GEMINI_API_KEY, ...[2, 3, 4, 5].map(i => process.env[`GEMINI_API_KEY_${i}`])]
+    .filter(Boolean);
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
-const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+console.log(`مفاتيح Gemini المفعّلة: ${GEMINI_KEYS.length}`);
 const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.7-flash';
 
 // شخصية البوت (تقدر تغيرها من متغير البيئة BOT_PERSONA بدون ما تلمس الكود)
@@ -58,7 +63,7 @@ const AUTOREPLY_COOLDOWN_MS = parseInt(process.env.AUTOREPLY_COOLDOWN_SEC || '30
 const autoReplyCooldown = new Map();
 
 // ميزانية يومية للردود التلقائية (سوالف البوت) عشان ما تستهلك حصة Gemini المجانية وتخلي المنشن يشتغل
-const BACKGROUND_DAILY_MAX = parseInt(process.env.BACKGROUND_DAILY_MAX || ((process.env.GROQ_API_KEY || process.env.MISTRAL_API_KEY || process.env.CEREBRAS_API_KEY || process.env.OPENROUTER_API_KEY) ? '150' : '6'), 10);
+const BACKGROUND_DAILY_MAX = parseInt(process.env.BACKGROUND_DAILY_MAX || ((process.env.MISTRAL_API_KEY || process.env.CEREBRAS_API_KEY || process.env.OPENROUTER_API_KEY) ? '150' : '6'), 10);
 let bgDay = '';
 let bgUsed = 0;
 function takeBackgroundBudget() {
@@ -96,23 +101,44 @@ function buildContents(channelId, fallbackPrompt) {
 }
 
 
-// يرسل طلب لـ Gemini مع شخصية البوت، وإعادة محاولة تلقائية لو الخدمة مشغولة (503/429) وموديل احتياطي
+// عميل Gemini منفصل لكل مفتاح، نبنيه مرة وحدة ونعيد استخدامه
+const geminiClients = GEMINI_KEYS.map(key => new GoogleGenAI({ apiKey: key }));
+let geminiKeyCursor = 0;
+
+// يرسل طلب لـ Gemini، يدور بين كل المفاتيح المتوفرة (لو مفتاح وصل حده ينتقل للي بعده)،
+// مع إعادة محاولة عند انشغال الخدمة (503) وموديل احتياطي
 async function askGeminiOnly(contents) {
+    if (geminiClients.length === 0) {
+        const e = new Error('لا يوجد مفتاح Gemini');
+        e.status = 0;
+        throw e;
+    }
+
     const models = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL];
     let lastError;
-    for (const model of models) {
-        for (let attempt = 0; attempt < 3; attempt++) {
-            try {
-                return await ai.models.generateContent({
-                    model,
-                    contents,
-                    config: { systemInstruction: BOT_PERSONA }
-                });
-            } catch (e) {
-                lastError = e;
-                const retryable = e?.status === 503; // 429 (حد الحصة) ما ينفع معه إعادة محاولة سريعة
-                if (!retryable) break; // خطأ دائم (مثل 404)، جرب الموديل التالي مباشرة
-                await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+
+    for (let k = 0; k < geminiClients.length; k++) {
+        const idx = (geminiKeyCursor + k) % geminiClients.length;
+        const client = geminiClients[idx];
+
+        for (const model of models) {
+            for (let attempt = 0; attempt < 2; attempt++) {
+                try {
+                    const result = await client.models.generateContent({
+                        model,
+                        contents,
+                        config: { systemInstruction: BOT_PERSONA }
+                    });
+                    geminiKeyCursor = (idx + 1) % geminiClients.length;
+                    return result;
+                } catch (e) {
+                    lastError = e;
+                    if (e?.status === 503 && attempt === 0) {
+                        await new Promise(r => setTimeout(r, 1500));
+                        continue; // نعيد نفس المفتاح والموديل مرة وحدة بس
+                    }
+                    break; // 429 (خلصت حصة هذا المفتاح) أو خطأ دائم، جرب الموديل التالي أو المفتاح التالي
+                }
             }
         }
     }
@@ -122,12 +148,6 @@ async function askGeminiOnly(contents) {
 
 // --- عدة مزودين ذكاء اصطناعي مجانيين (كلهم بصيغة OpenAI). يشتغل اللي مفتاحه موجود بـ Render ---
 const PROVIDERS = [
-    {
-        name: 'Groq',
-        key: process.env.GROQ_API_KEY,
-        url: 'https://api.groq.com/openai/v1/chat/completions',
-        model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile'
-    },
     {
         name: 'Mistral',
         key: process.env.MISTRAL_API_KEY,
@@ -224,11 +244,20 @@ async function askOpenAICompat(provider, contents, allowDiscovery = true) {
     return { text: cleanModelText(data.choices?.[0]?.message?.content) };
 }
 
-// نوزع الطلبات على المزودين بالتناوب عشان ما تخلص حصة واحد بسرعة
+// نوزع الطلبات على المزودين الاحتياطيين بالتناوب عشان ما تخلص حصة واحد بسرعة
 let providerCursor = 0;
 
-// الدالة الرئيسية: يجرب المزودين واحد ورا الثاني، وآخر شي Gemini
+// الدالة الرئيسية: Gemini أولاً (بكل مفاتيحه)، وإذا فشلت كلها ننتقل للمزودين الاحتياطيين (Groq وغيره)
 async function askAI(contents) {
+    if (geminiClients.length > 0) {
+        try {
+            const r = await askGeminiOnly(contents);
+            if (r?.text) return r;
+        } catch (e) {
+            console.error('كل مفاتيح Gemini فشلت، نجرب المزودين الاحتياطيين:', e.message);
+        }
+    }
+
     const count = PROVIDERS.length;
     for (let i = 0; i < count; i++) {
         const provider = PROVIDERS[(providerCursor + i) % count];
@@ -242,7 +271,9 @@ async function askAI(contents) {
             console.error(`${provider.name} فشل، نجرب اللي بعده:`, e.message);
         }
     }
-    return askGeminiOnly(contents);
+
+    if (geminiClients.length === 0) return askGeminiOnly(contents); // يرمي رسالة الخطأ الواضحة لو ما فيه أي مزود أصلاً
+    throw new Error('كل المزودين فشلوا');
 }
 
 const ytdlp = new YtDlp();
