@@ -62,6 +62,14 @@ function pushHistory(channelId, role, text) {
     chatHistory.set(channelId, arr);
 }
 
+// يجهز نسخة آمنة من سجل الحوار لكل طلب: تبدأ برسالة مستخدم وتنتهي برسالة مستخدم (شرط Gemini)
+function buildContents(channelId, fallbackPrompt) {
+    const snapshot = [...(chatHistory.get(channelId) || [])];
+    while (snapshot.length && snapshot[0].role !== 'user') snapshot.shift();
+    while (snapshot.length && snapshot[snapshot.length - 1].role !== 'user') snapshot.pop();
+    return snapshot.length ? snapshot : fallbackPrompt;
+}
+
 
 // يرسل طلب لـ Gemini مع شخصية البوت، وإعادة محاولة تلقائية لو الخدمة مشغولة (503/429) وموديل احتياطي
 async function askGemini(contents) {
@@ -1036,7 +1044,7 @@ client.on('messageCreate', async (message) => {
         try {
             await message.channel.sendTyping();
             pushHistory(message.channel.id, 'user', `${message.author.username}: ${prompt}`);
-            const response = await askGemini(chatHistory.get(message.channel.id));
+            const response = await askGemini(buildContents(message.channel.id, prompt));
             const responseText = response.text;
             pushHistory(message.channel.id, 'model', responseText);
 
