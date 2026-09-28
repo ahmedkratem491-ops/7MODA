@@ -53,6 +53,18 @@ const AUTOREPLY_CHANCE = parseFloat(process.env.AUTOREPLY_CHANCE || '0.3');
 const AUTOREPLY_COOLDOWN_MS = parseInt(process.env.AUTOREPLY_COOLDOWN_SEC || '60', 10) * 1000;
 const autoReplyCooldown = new Map();
 
+// ميزانية يومية للردود التلقائية (سوالف البوت) عشان ما تستهلك حصة Gemini المجانية وتخلي المنشن يشتغل
+const BACKGROUND_DAILY_MAX = parseInt(process.env.BACKGROUND_DAILY_MAX || ((process.env.GROQ_API_KEY || process.env.MISTRAL_API_KEY || process.env.CEREBRAS_API_KEY || process.env.OPENROUTER_API_KEY) ? '40' : '6'), 10);
+let bgDay = '';
+let bgUsed = 0;
+function takeBackgroundBudget() {
+    const today = new Date().toISOString().slice(0, 10);
+    if (today !== bgDay) { bgDay = today; bgUsed = 0; }
+    if (bgUsed >= BACKGROUND_DAILY_MAX) return false;
+    bgUsed++;
+    return true;
+}
+
 // ذاكرة قصيرة لكل روم عشان يتذكر سياق الحوار (آخر 10 رسائل)
 const chatHistory = new Map();
 function pushHistory(channelId, role, text) {
@@ -72,7 +84,7 @@ function buildContents(channelId, fallbackPrompt) {
 
 
 // يرسل طلب لـ Gemini مع شخصية البوت، وإعادة محاولة تلقائية لو الخدمة مشغولة (503/429) وموديل احتياطي
-async function askGemini(contents) {
+async function askGeminiOnly(contents) {
     const models = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL];
     let lastError;
     for (const model of models) {
@@ -85,13 +97,104 @@ async function askGemini(contents) {
                 });
             } catch (e) {
                 lastError = e;
-                const retryable = e?.status === 503 || e?.status === 429;
+                const retryable = e?.status === 503; // 429 (حد الحصة) ما ينفع معه إعادة محاولة سريعة
                 if (!retryable) break; // خطأ دائم (مثل 404)، جرب الموديل التالي مباشرة
                 await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
             }
         }
     }
     throw lastError;
+}
+
+
+// --- عدة مزودين ذكاء اصطناعي مجانيين (كلهم بصيغة OpenAI). يشتغل اللي مفتاحه موجود بـ Render ---
+const PROVIDERS = [
+    {
+        name: 'Groq',
+        key: process.env.GROQ_API_KEY,
+        url: 'https://api.groq.com/openai/v1/chat/completions',
+        model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile'
+    },
+    {
+        name: 'Mistral',
+        key: process.env.MISTRAL_API_KEY,
+        url: 'https://api.mistral.ai/v1/chat/completions',
+        model: process.env.MISTRAL_MODEL || 'mistral-small-latest'
+    },
+    {
+        name: 'Cerebras',
+        key: process.env.CEREBRAS_API_KEY,
+        url: 'https://api.cerebras.ai/v1/chat/completions',
+        model: process.env.CEREBRAS_MODEL || 'llama-3.3-70b'
+    },
+    {
+        name: 'OpenRouter',
+        key: process.env.OPENROUTER_API_KEY,
+        url: 'https://openrouter.ai/api/v1/chat/completions',
+        model: process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free'
+    }
+].filter(p => p.key);
+
+console.log('مزودو الذكاء الاصطناعي المفعّلون:', PROVIDERS.map(p => p.name).join(', ') || 'لا يوجد (Gemini فقط)');
+
+function toOpenAIMessages(contents) {
+    const messages = [{ role: 'system', content: BOT_PERSONA }];
+    if (typeof contents === 'string') {
+        messages.push({ role: 'user', content: contents });
+    } else {
+        for (const turn of contents) {
+            messages.push({
+                role: turn.role === 'model' ? 'assistant' : 'user',
+                content: turn.parts.map(p => p.text).join('')
+            });
+        }
+    }
+    return messages;
+}
+
+async function askOpenAICompat(provider, contents) {
+    const res = await fetch(provider.url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${provider.key}`
+        },
+        body: JSON.stringify({
+            model: provider.model,
+            messages: toOpenAIMessages(contents),
+            temperature: 0.9,
+            max_tokens: 400
+        }),
+        signal: AbortSignal.timeout(20000)
+    });
+    if (!res.ok) {
+        const err = new Error(`${provider.name} ${res.status}: ${(await res.text()).slice(0, 300)}`);
+        err.status = res.status;
+        throw err;
+    }
+    const data = await res.json();
+    return { text: data.choices?.[0]?.message?.content || '' };
+}
+
+// نوزع الطلبات على المزودين بالتناوب عشان ما تخلص حصة واحد بسرعة
+let providerCursor = 0;
+
+// الدالة الرئيسية: يجرب المزودين واحد ورا الثاني، وآخر شي Gemini
+async function askAI(contents) {
+    const count = PROVIDERS.length;
+    for (let i = 0; i < count; i++) {
+        const provider = PROVIDERS[(providerCursor + i) % count];
+        try {
+            const r = await askOpenAICompat(provider, contents);
+            if (r.text) {
+                providerCursor = (providerCursor + i + 1) % count;
+                return r;
+            }
+        } catch (e) {
+            console.error(`${provider.name} فشل، نجرب اللي بعده:`, e.message);
+        }
+    }
+    return askGeminiOnly(contents);
 }
 
 const ytdlp = new YtDlp();
@@ -437,6 +540,7 @@ client.once('clientReady', async () => {
         autoChatInterval = setInterval(async () => {
             for (const [guildId, config] of autoChatSettings.entries()) {
                 if (!config.enabled || !config.channelId) continue;
+                if (!takeBackgroundBudget()) continue;
                 try {
                     const guild = await client.guilds.fetch(guildId).catch(() => null);
                     if (!guild) continue;
@@ -456,13 +560,13 @@ client.once('clientReady', async () => {
                         ? `هذي آخر رسائل الروم:\n${transcript}\n\nاكتب مداخلة قصيرة وطبيعية تعلّق فيها على الكلام أو تفتح موضوع جانبي مرتبط فيه، كأنك واحد من الشلة.`
                         : 'الروم هادي. افتح موضوع سوالف خفيف ومسلي بجملة أو جملتين.';
 
-                    const response = await askGemini(prompt);
+                    const response = await askAI(prompt);
                     await channel.send(response.text);
                 } catch (e) {
                     console.error('خطأ في الـ Auto-Chat:', e);
                 }
             }
-        }, 30 * 60 * 1000);
+        }, parseInt(process.env.AUTOCHAT_INTERVAL_MIN || '180', 10) * 60 * 1000);
     }
 });
 
@@ -991,7 +1095,7 @@ client.on('messageCreate', async (message) => {
     if (isFormMessage) {
         try {
             await message.channel.sendTyping();
-            const response = await askGemini("واحد من الأعضاء توه عبّى وأرسل نموذج (فورم) بالسيرفر. اكتب له رد قصير مشجع ولطيف.");
+            const response = await askAI("واحد من الأعضاء توه عبّى وأرسل نموذج (فورم) بالسيرفر. اكتب له رد قصير مشجع ولطيف.");
             await message.reply(response.text);
             return;
         } catch (e) {
@@ -1011,7 +1115,7 @@ client.on('messageCreate', async (message) => {
     ) {
         const now = Date.now();
         const last = autoReplyCooldown.get(message.channel.id) || 0;
-        if (now - last >= AUTOREPLY_COOLDOWN_MS && Math.random() < AUTOREPLY_CHANCE) {
+        if (now - last >= AUTOREPLY_COOLDOWN_MS && Math.random() < AUTOREPLY_CHANCE && takeBackgroundBudget()) {
             autoReplyCooldown.set(message.channel.id, now); // نسجل الوقت قبل الطلب عشان ما يتكرر
             try {
                 const recent = await message.channel.messages.fetch({ limit: 10 }).catch(() => null);
@@ -1022,7 +1126,7 @@ client.on('messageCreate', async (message) => {
                         .join('\n')
                     : `${message.author.username}: ${message.content}`;
 
-                const response = await askGemini(
+                const response = await askAI(
                     `هذي آخر رسائل الروم:\n${transcript}\n\nانت واحد من الشلة وقاعد تقرا الكلام. لو عندك تعليق أو مزحة أو سؤال طبيعي يناسب الحوار الأخير، اكتبه بجملة أو جملتين. لو ما في شي يستاهل تقوله، اكتب كلمة SKIP فقط.`
                 );
                 const text = (response.text || '').trim();
@@ -1044,7 +1148,7 @@ client.on('messageCreate', async (message) => {
         try {
             await message.channel.sendTyping();
             pushHistory(message.channel.id, 'user', `${message.author.username}: ${prompt}`);
-            const response = await askGemini(buildContents(message.channel.id, prompt));
+            const response = await askAI(buildContents(message.channel.id, prompt));
             const responseText = response.text;
             pushHistory(message.channel.id, 'model', responseText);
 
@@ -1055,7 +1159,9 @@ client.on('messageCreate', async (message) => {
             }
         } catch (error) {
             console.error('خطأ في الـ AI:', error);
-            await message.reply('❌ تعذر الاتصال بالذكاء الاصطناعي حالياً.');
+            await message.reply(error?.status === 429
+                ? '⏳ وصلت حد الاستخدام اليومي للذكاء الاصطناعي، جرب بعد شوي.'
+                : '❌ تعذر الاتصال بالذكاء الاصطناعي حالياً.');
         }
     }
 });
