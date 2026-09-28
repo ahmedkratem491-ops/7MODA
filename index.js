@@ -41,20 +41,24 @@ const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.7-flash';
 
 // شخصية البوت (تقدر تغيرها من متغير البيئة BOT_PERSONA بدون ما تلمس الكود)
-const BOT_PERSONA = process.env.BOT_PERSONA || `أنت بوت ديسكورد اسمه "Report bot"، شخصية شبابية مرحة وخفيفة دم، تتكلم باللهجة الليبية البيضاء بشكل عفوي كأنك واحد من الشلة.
-- ردودك قصيرة (سطر إلى ثلاثة أسطر) وطبيعية، بدون مقدمات رسمية وبدون قوائم وبدون عناوين.
-- تمزح وتعلّق وتسأل أسئلة جانبية أحياناً، وتستخدم إيموجي بشكل خفيف.
-- لا تقول "كنموذج ذكاء اصطناعي" ولا تذكر جوجل أو Gemini أبداً.
-- لو أحد سألك بجدية هل أنت إنسان، اعترف إنك بوت ذكاء اصطناعي بدون تفاصيل تقنية.
-- لا تكتب محتوى مسيء أو جارح، وخلي المزح لطيف.`;
+const BOT_PERSONA = process.env.BOT_PERSONA || `أنت عضو عادي في سيرفر ديسكورد اسمك "Report"، شاب عربي عمره حوالي 20 سنة، تسولف مع الشلة بشكل طبيعي جداً.
+طريقة كلامك:
+- لهجة عربية بيضاء مكس: تخلط بشكل عفوي بين الخليجي والمصري والشامي والمغاربي حسب المزاج (مثل "شخبارك"، "ازيك"، "كيفك"، "يا زلمة"، "وش تسوي")، بدون ما تلتزم بلهجة وحدة، ومو عربي فصيح ولا رسمي أبداً.
+- ردودك قصيرة مثل رسايل الشات الحقيقية: كلمة أو جملة أو جملتين بالكثير. أحياناً تكتفي بتعليق أو مزحة أو إيموجي.
+- تتفاعل مع كلام الشخص نفسه: تعلّق، تمزح، تختلف معاه، تسأله سؤال رجعي. لا تجاوب كأنك تكتب مقال.
+- لا تستخدم قوائم ولا عناوين ولا نقاط ولا نص عريض، ولا تبدأ ردك بـ "بالتأكيد" أو "بالطبع" أو "أهلاً بك".
+- لا تعرض مساعدة ولا تقول "كيف أقدر أساعدك"، أنت صاحبهم مو مساعد.
+- لا تذكر إنك نموذج ذكاء اصطناعي ولا تذكر جوجل أو Gemini أو Groq أو أي شركة، إلا لو أحد سألك بجدية وصراحة هل أنت بوت أو إنسان، فقلها بدون لف: إنك بوت ذكاء اصطناعي.
+- لو ما تعرف شي، قل "ما أدري" عادي، لا تخترع معلومات.
+- المزح لطيف وخفيف، بدون إساءة أو كلام جارح.`;
 
 // إعدادات الرد التلقائي بدون منشن (تتغير من متغيرات البيئة)
-const AUTOREPLY_CHANCE = parseFloat(process.env.AUTOREPLY_CHANCE || '0.3');
-const AUTOREPLY_COOLDOWN_MS = parseInt(process.env.AUTOREPLY_COOLDOWN_SEC || '60', 10) * 1000;
+const AUTOREPLY_CHANCE = parseFloat(process.env.AUTOREPLY_CHANCE || '0.5');
+const AUTOREPLY_COOLDOWN_MS = parseInt(process.env.AUTOREPLY_COOLDOWN_SEC || '30', 10) * 1000;
 const autoReplyCooldown = new Map();
 
 // ميزانية يومية للردود التلقائية (سوالف البوت) عشان ما تستهلك حصة Gemini المجانية وتخلي المنشن يشتغل
-const BACKGROUND_DAILY_MAX = parseInt(process.env.BACKGROUND_DAILY_MAX || ((process.env.GROQ_API_KEY || process.env.MISTRAL_API_KEY || process.env.CEREBRAS_API_KEY || process.env.OPENROUTER_API_KEY) ? '40' : '6'), 10);
+const BACKGROUND_DAILY_MAX = parseInt(process.env.BACKGROUND_DAILY_MAX || ((process.env.GROQ_API_KEY || process.env.MISTRAL_API_KEY || process.env.CEREBRAS_API_KEY || process.env.OPENROUTER_API_KEY) ? '150' : '6'), 10);
 let bgDay = '';
 let bgUsed = 0;
 function takeBackgroundBudget() {
@@ -1138,12 +1142,20 @@ client.on('messageCreate', async (message) => {
         }
     }
 
+    // لو الرسالة رد على رسالة من البوت، نعتبرها كأنها منشن (يكمل الحوار طبيعي)
+    let isReplyToBot = false;
+    if (message.reference?.messageId && !message.mentions.has(client.user.id)) {
+        const ref = await message.fetchReference().catch(() => null);
+        isReplyToBot = ref?.author?.id === client.user.id;
+    }
+
     // --- دخول البوت بالسوالف من نفسه في روم الدردشة التلقائية (بدون منشن) ---
     const autoCfg = message.guild ? autoChatSettings.get(message.guild.id) : null;
     if (
         autoCfg?.enabled &&
         autoCfg.channelId === message.channel.id &&
         !message.mentions.has(client.user.id) &&
+        !isReplyToBot &&
         message.content &&
         message.content.length >= 3 &&
         !message.content.startsWith('/')
@@ -1176,7 +1188,7 @@ client.on('messageCreate', async (message) => {
         }
     }
 
-    if (message.mentions.has(client.user.id)) {
+    if (message.mentions.has(client.user.id) || isReplyToBot) {
         const prompt = message.content.replace(/<@!?\d+>/g, '').trim();
         if (!prompt) return message.reply('نعم؟ تفضل وسلني عن أي شيء!');
 
