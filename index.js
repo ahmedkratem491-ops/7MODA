@@ -152,7 +152,34 @@ function toOpenAIMessages(contents) {
     return messages;
 }
 
-async function askOpenAICompat(provider, contents) {
+// يشيل وسوم التفكير الداخلي اللي تطلع من بعض النماذج (مثل <think>...</think>)
+function cleanModelText(text) {
+    return (text || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+}
+
+// لو اسم النموذج انحذف، نسأل المزود عن قائمة النماذج الحالية ونختار أنسب واحد للسوالف
+const MODEL_PREFERENCE = [
+    /llama-3\.3-70b/i, /llama-4-maverick/i, /llama-4-scout/i, /llama-3\.1-70b/i,
+    /mistral-(small|medium|large)/i, /gpt-oss-120b/i, /qwen.*32b/i, /gpt-oss-20b/i, /llama-3\.1-8b/i
+];
+const MODEL_EXCLUDE = /whisper|guard|tts|embed|orpheus|playai|safeguard|moderation|vision|ocr|transcribe|rerank|compound/i;
+
+async function discoverModel(provider) {
+    const res = await fetch(provider.url.replace('/chat/completions', '/models'), {
+        headers: { 'Authorization': `Bearer ${provider.key}` },
+        signal: AbortSignal.timeout(15000)
+    });
+    if (!res.ok) throw new Error(`تعذر جلب قائمة نماذج ${provider.name}: ${res.status}`);
+    const data = await res.json();
+    const ids = (data.data || []).map(m => m.id).filter(id => id && !MODEL_EXCLUDE.test(id));
+    for (const pattern of MODEL_PREFERENCE) {
+        const found = ids.find(id => pattern.test(id));
+        if (found) return found;
+    }
+    return ids[0] || null;
+}
+
+async function askOpenAICompat(provider, contents, allowDiscovery = true) {
     const res = await fetch(provider.url, {
         method: 'POST',
         headers: {
@@ -168,12 +195,20 @@ async function askOpenAICompat(provider, contents) {
         signal: AbortSignal.timeout(20000)
     });
     if (!res.ok) {
+        if (res.status === 404 && allowDiscovery) {
+            const newModel = await discoverModel(provider);
+            if (newModel && newModel !== provider.model) {
+                console.log(`🔄 ${provider.name}: النموذج ${provider.model} غير متاح، نستخدم ${newModel}`);
+                provider.model = newModel;
+                return askOpenAICompat(provider, contents, false);
+            }
+        }
         const err = new Error(`${provider.name} ${res.status}: ${(await res.text()).slice(0, 300)}`);
         err.status = res.status;
         throw err;
     }
     const data = await res.json();
-    return { text: data.choices?.[0]?.message?.content || '' };
+    return { text: cleanModelText(data.choices?.[0]?.message?.content) };
 }
 
 // نوزع الطلبات على المزودين بالتناوب عشان ما تخلص حصة واحد بسرعة
