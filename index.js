@@ -36,6 +36,7 @@ app.listen(port, () => console.log(`Server is running on port ${port}`));
 
 // --- 2. إعداد الـ AI والبوت ومحرك تشغيل يوتيوب (yt-dlp) ---
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 const ytdlp = new YtDlp();
@@ -272,17 +273,6 @@ const commands = [
         .setDescription('استئناف تشغيل الأغنية بعد الإيقاف المؤقت'),
 
     new SlashCommandBuilder()
-        .setName('volume')
-        .setDescription('ضبط مستوى صوت التشغيل')
-        .addIntegerOption(opt =>
-            opt.setName('level')
-                .setDescription('المستوى من 0 إلى 150')
-                .setMinValue(0)
-                .setMaxValue(150)
-                .setRequired(true)
-        ),
-
-    new SlashCommandBuilder()
         .setName('loop')
         .setDescription('تكرار الأغنية الحالية أو كل القائمة')
         .addStringOption(opt =>
@@ -399,7 +389,7 @@ client.once('clientReady', async () => {
                     if (!channel) continue;
 
                     const response = await ai.models.generateContent({
-                        model: 'gemini-2.5-flash',
+                        model: GEMINI_MODEL,
                         contents: "اكتب رسالة قصيرة، لطيفة وتفاعلية للدردشة مع الأعضاء في السيرفر لفتح موضوع نقاش جانبي مسلي."
                     });
                     await channel.send(response.text);
@@ -515,7 +505,6 @@ client.on('interactionCreate', async (interaction) => {
                     }),
                     resource: null,
                     songs: [],
-                    volume: 100,
                     loop: 'off', // off | song | queue
                     playing: true
                 };
@@ -638,19 +627,6 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply(resumed ? '▶️ تم استئناف التشغيل.' : '❌ التشغيل شغال بالفعل.');
     }
 
-    if (commandName === 'volume') {
-        const serverQueue = musicQueue.get(guild.id);
-        const level = options.getInteger('level');
-        if (!serverQueue) {
-            return interaction.reply({ content: '❌ لا يوجد شيء يشتغل حالياً!', flags: MessageFlags.Ephemeral });
-        }
-        serverQueue.volume = level;
-        if (serverQueue.resource?.volume) {
-            serverQueue.resource.volume.setVolume(level / 100);
-        }
-        return interaction.reply(`🔊 تم ضبط مستوى الصوت على ${level}%.`);
-    }
-
     if (commandName === 'loop') {
         const serverQueue = musicQueue.get(guild.id);
         const mode = options.getString('mode');
@@ -694,7 +670,6 @@ client.on('interactionCreate', async (interaction) => {
             .setDescription(`[${current.title}](${current.url})`)
             .addFields(
                 { name: 'المدة', value: current.duration || 'غير معروف', inline: true },
-                { name: 'مستوى الصوت', value: `${serverQueue.volume}%`, inline: true },
                 { name: 'التكرار', value: serverQueue.loop, inline: true }
             )
             .setThumbnail(current.thumbnail)
@@ -708,7 +683,7 @@ client.on('interactionCreate', async (interaction) => {
             .setTitle('📖 قائمة أوامر البوت')
             .setColor(0x5865F2)
             .addFields(
-                { name: '🎵 الموسيقى', value: '`/play` `/skip` `/stop` `/pause` `/resume` `/volume` `/loop` `/queue` `/nowplaying`' },
+                { name: '🎵 الموسيقى', value: '`/play` `/skip` `/stop` `/pause` `/resume` `/loop` `/queue` `/nowplaying`' },
                 { name: '🛡️ الإدارة', value: '`/warn` `/history` `/unwarn` `/timeout` `/untimeout` `/kick` `/ban` `/unban`' },
                 { name: '⚙️ الإعدادات', value: '`/log` `/autochat` `/afkvoice`' }
             )
@@ -952,7 +927,7 @@ client.on('messageCreate', async (message) => {
         try {
             await message.channel.sendTyping();
             const response = await ai.models.generateContent({
-                model: 'gemini-2.5-flash',
+                model: GEMINI_MODEL,
                 contents: "أنت بوت سيرفر ديسكورد. قم بكتابة رد مشجع ومادح ولطيف جداً لشخص قام للتو بتعبئة وإرسال نموذج أو فورم في السيرفر."
             });
             await message.reply(response.text);
@@ -969,7 +944,7 @@ client.on('messageCreate', async (message) => {
         try {
             await message.channel.sendTyping();
             const response = await ai.models.generateContent({
-                model: 'gemini-2.5-flash',
+                model: GEMINI_MODEL,
                 contents: prompt
             });
             const responseText = response.text;
@@ -1151,9 +1126,12 @@ async function playSong(guild, song) {
             '-i', 'pipe:0',
             '-analyzeduration', '0',
             '-loglevel', '0',
-            '-f', 's16le',
+            '-vn',
+            '-c:a', 'libopus',
+            '-b:a', '96k',
             '-ar', '48000',
             '-ac', '2',
+            '-f', 'ogg',
             'pipe:1'
         ], { stdio: ['pipe', 'pipe', 'ignore'] });
 
@@ -1168,10 +1146,8 @@ async function playSong(guild, song) {
         serverQueue.ffmpegProcess = ffmpegProcess;
 
         const resource = createAudioResource(ffmpegProcess.stdout, {
-            inputType: StreamType.Raw,
-            inlineVolume: true
+            inputType: StreamType.OggOpus
         });
-        resource.volume.setVolume((serverQueue.volume || 100) / 100);
         serverQueue.resource = resource;
 
         serverQueue.player.play(resource);
