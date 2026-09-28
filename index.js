@@ -38,6 +38,26 @@ app.listen(port, () => console.log(`Server is running on port ${port}`));
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.7-flash';
+
+// يرسل طلب لـ Gemini مع إعادة محاولة تلقائية لو الخدمة مشغولة (503/429) وموديل احتياطي
+async function askGemini(contents) {
+    const models = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL];
+    let lastError;
+    for (const model of models) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                return await ai.models.generateContent({ model, contents });
+            } catch (e) {
+                lastError = e;
+                const retryable = e?.status === 503 || e?.status === 429;
+                if (!retryable) break; // خطأ دائم (مثل 404)، جرب الموديل التالي مباشرة
+                await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+            }
+        }
+    }
+    throw lastError;
+}
 
 const ytdlp = new YtDlp();
 
@@ -388,10 +408,7 @@ client.once('clientReady', async () => {
                     const channel = await guild.channels.fetch(config.channelId).catch(() => null);
                     if (!channel) continue;
 
-                    const response = await ai.models.generateContent({
-                        model: GEMINI_MODEL,
-                        contents: "اكتب رسالة قصيرة، لطيفة وتفاعلية للدردشة مع الأعضاء في السيرفر لفتح موضوع نقاش جانبي مسلي."
-                    });
+                    const response = await askGemini("اكتب رسالة قصيرة، لطيفة وتفاعلية للدردشة مع الأعضاء في السيرفر لفتح موضوع نقاش جانبي مسلي.");
                     await channel.send(response.text);
                 } catch (e) {
                     console.error('خطأ في الـ Auto-Chat:', e);
@@ -926,10 +943,7 @@ client.on('messageCreate', async (message) => {
     if (isFormMessage) {
         try {
             await message.channel.sendTyping();
-            const response = await ai.models.generateContent({
-                model: GEMINI_MODEL,
-                contents: "أنت بوت سيرفر ديسكورد. قم بكتابة رد مشجع ومادح ولطيف جداً لشخص قام للتو بتعبئة وإرسال نموذج أو فورم في السيرفر."
-            });
+            const response = await askGemini("أنت بوت سيرفر ديسكورد. قم بكتابة رد مشجع ومادح ولطيف جداً لشخص قام للتو بتعبئة وإرسال نموذج أو فورم في السيرفر.");
             await message.reply(response.text);
             return;
         } catch (e) {
@@ -943,10 +957,7 @@ client.on('messageCreate', async (message) => {
 
         try {
             await message.channel.sendTyping();
-            const response = await ai.models.generateContent({
-                model: GEMINI_MODEL,
-                contents: prompt
-            });
+            const response = await askGemini(prompt);
             const responseText = response.text;
 
             if (responseText.length > 2000) {
