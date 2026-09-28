@@ -69,6 +69,15 @@ function takeBackgroundBudget() {
     return true;
 }
 
+// ردود عفوية لما كل مزودي الذكاء الاصطناعي يفشلون (بنفس أسلوب شخصية البوت)
+const BUSY_REPLIES = [
+    'مشغول شوي، كلمني بعد شوي 😅',
+    'استنى شوي يا صاحبي، راسي مسدود الحين 😵',
+    'لحظة، مشغول الحين، ارجع لي بعد شوي',
+    'والله زحمة عندي الحين، جرب بعد دقايق 🙏',
+    'مو قادر أرد الحين، ثواني وأرجع 😅'
+];
+
 // ذاكرة قصيرة لكل روم عشان يتذكر سياق الحوار (آخر 10 رسائل)
 const chatHistory = new Map();
 function pushHistory(channelId, role, text) {
@@ -1206,9 +1215,7 @@ client.on('messageCreate', async (message) => {
             }
         } catch (error) {
             console.error('خطأ في الـ AI:', error);
-            await message.reply(error?.status === 429
-                ? '⏳ وصلت حد الاستخدام اليومي للذكاء الاصطناعي، جرب بعد شوي.'
-                : '❌ تعذر الاتصال بالذكاء الاصطناعي حالياً.');
+            await message.reply(BUSY_REPLIES[Math.floor(Math.random() * BUSY_REPLIES.length)]).catch(() => null);
         }
     }
 });
