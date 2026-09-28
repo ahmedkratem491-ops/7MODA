@@ -40,14 +40,41 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.7-flash';
 
-// يرسل طلب لـ Gemini مع إعادة محاولة تلقائية لو الخدمة مشغولة (503/429) وموديل احتياطي
+// شخصية البوت (تقدر تغيرها من متغير البيئة BOT_PERSONA بدون ما تلمس الكود)
+const BOT_PERSONA = process.env.BOT_PERSONA || `أنت بوت ديسكورد اسمه "Report bot"، شخصية شبابية مرحة وخفيفة دم، تتكلم باللهجة الليبية البيضاء بشكل عفوي كأنك واحد من الشلة.
+- ردودك قصيرة (سطر إلى ثلاثة أسطر) وطبيعية، بدون مقدمات رسمية وبدون قوائم وبدون عناوين.
+- تمزح وتعلّق وتسأل أسئلة جانبية أحياناً، وتستخدم إيموجي بشكل خفيف.
+- لا تقول "كنموذج ذكاء اصطناعي" ولا تذكر جوجل أو Gemini أبداً.
+- لو أحد سألك بجدية هل أنت إنسان، اعترف إنك بوت ذكاء اصطناعي بدون تفاصيل تقنية.
+- لا تكتب محتوى مسيء أو جارح، وخلي المزح لطيف.`;
+
+// إعدادات الرد التلقائي بدون منشن (تتغير من متغيرات البيئة)
+const AUTOREPLY_CHANCE = parseFloat(process.env.AUTOREPLY_CHANCE || '0.3');
+const AUTOREPLY_COOLDOWN_MS = parseInt(process.env.AUTOREPLY_COOLDOWN_SEC || '60', 10) * 1000;
+const autoReplyCooldown = new Map();
+
+// ذاكرة قصيرة لكل روم عشان يتذكر سياق الحوار (آخر 10 رسائل)
+const chatHistory = new Map();
+function pushHistory(channelId, role, text) {
+    const arr = chatHistory.get(channelId) || [];
+    arr.push({ role, parts: [{ text }] });
+    while (arr.length > 10) arr.shift();
+    chatHistory.set(channelId, arr);
+}
+
+
+// يرسل طلب لـ Gemini مع شخصية البوت، وإعادة محاولة تلقائية لو الخدمة مشغولة (503/429) وموديل احتياطي
 async function askGemini(contents) {
     const models = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL];
     let lastError;
     for (const model of models) {
         for (let attempt = 0; attempt < 3; attempt++) {
             try {
-                return await ai.models.generateContent({ model, contents });
+                return await ai.models.generateContent({
+                    model,
+                    contents,
+                    config: { systemInstruction: BOT_PERSONA }
+                });
             } catch (e) {
                 lastError = e;
                 const retryable = e?.status === 503 || e?.status === 429;
@@ -228,7 +255,7 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName('autochat')
-        .setDescription('تفعيل أو إيقاف الدردشة التلقائية للذكاء الاصطناعي كل 30 دقيقة')
+        .setDescription('تفعيل أو إيقاف سوالف البوت التلقائية (يدخل بالحوار ويفتح مواضيع)')
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
         .addStringOption(opt =>
             opt.setName('status')
@@ -408,7 +435,20 @@ client.once('clientReady', async () => {
                     const channel = await guild.channels.fetch(config.channelId).catch(() => null);
                     if (!channel) continue;
 
-                    const response = await askGemini("اكتب رسالة قصيرة، لطيفة وتفاعلية للدردشة مع الأعضاء في السيرفر لفتح موضوع نقاش جانبي مسلي.");
+                    // نقرأ آخر رسائل الروم عشان يعلّق على الحوار الحالي بدل ما يرمي كلام عشوائي
+                    const recent = await channel.messages.fetch({ limit: 12 }).catch(() => null);
+                    const transcript = recent
+                        ? [...recent.values()].reverse()
+                            .filter(m => m.content)
+                            .map(m => `${m.author.username}: ${m.content}`)
+                            .join('\n')
+                        : '';
+
+                    const prompt = transcript
+                        ? `هذي آخر رسائل الروم:\n${transcript}\n\nاكتب مداخلة قصيرة وطبيعية تعلّق فيها على الكلام أو تفتح موضوع جانبي مرتبط فيه، كأنك واحد من الشلة.`
+                        : 'الروم هادي. افتح موضوع سوالف خفيف ومسلي بجملة أو جملتين.';
+
+                    const response = await askGemini(prompt);
                     await channel.send(response.text);
                 } catch (e) {
                     console.error('خطأ في الـ Auto-Chat:', e);
@@ -943,11 +983,49 @@ client.on('messageCreate', async (message) => {
     if (isFormMessage) {
         try {
             await message.channel.sendTyping();
-            const response = await askGemini("أنت بوت سيرفر ديسكورد. قم بكتابة رد مشجع ومادح ولطيف جداً لشخص قام للتو بتعبئة وإرسال نموذج أو فورم في السيرفر.");
+            const response = await askGemini("واحد من الأعضاء توه عبّى وأرسل نموذج (فورم) بالسيرفر. اكتب له رد قصير مشجع ولطيف.");
             await message.reply(response.text);
             return;
         } catch (e) {
             console.error('خطأ في الرد على الفورم:', e);
+        }
+    }
+
+    // --- دخول البوت بالسوالف من نفسه في روم الدردشة التلقائية (بدون منشن) ---
+    const autoCfg = message.guild ? autoChatSettings.get(message.guild.id) : null;
+    if (
+        autoCfg?.enabled &&
+        autoCfg.channelId === message.channel.id &&
+        !message.mentions.has(client.user.id) &&
+        message.content &&
+        message.content.length >= 3 &&
+        !message.content.startsWith('/')
+    ) {
+        const now = Date.now();
+        const last = autoReplyCooldown.get(message.channel.id) || 0;
+        if (now - last >= AUTOREPLY_COOLDOWN_MS && Math.random() < AUTOREPLY_CHANCE) {
+            autoReplyCooldown.set(message.channel.id, now); // نسجل الوقت قبل الطلب عشان ما يتكرر
+            try {
+                const recent = await message.channel.messages.fetch({ limit: 10 }).catch(() => null);
+                const transcript = recent
+                    ? [...recent.values()].reverse()
+                        .filter(m => m.content)
+                        .map(m => `${m.author.username}: ${m.content}`)
+                        .join('\n')
+                    : `${message.author.username}: ${message.content}`;
+
+                const response = await askGemini(
+                    `هذي آخر رسائل الروم:\n${transcript}\n\nانت واحد من الشلة وقاعد تقرا الكلام. لو عندك تعليق أو مزحة أو سؤال طبيعي يناسب الحوار الأخير، اكتبه بجملة أو جملتين. لو ما في شي يستاهل تقوله، اكتب كلمة SKIP فقط.`
+                );
+                const text = (response.text || '').trim();
+                if (text && !/^SKIP\b/i.test(text)) {
+                    await message.channel.sendTyping().catch(() => null);
+                    await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000)); // تأخير بسيط يحسسك إنه يكتب
+                    await message.channel.send(text.slice(0, 1990));
+                }
+            } catch (e) {
+                console.error('خطأ في الرد التلقائي:', e);
+            }
         }
     }
 
@@ -957,8 +1035,10 @@ client.on('messageCreate', async (message) => {
 
         try {
             await message.channel.sendTyping();
-            const response = await askGemini(prompt);
+            pushHistory(message.channel.id, 'user', `${message.author.username}: ${prompt}`);
+            const response = await askGemini(chatHistory.get(message.channel.id));
             const responseText = response.text;
+            pushHistory(message.channel.id, 'model', responseText);
 
             if (responseText.length > 2000) {
                 await message.reply(responseText.slice(0, 1990) + '...');
