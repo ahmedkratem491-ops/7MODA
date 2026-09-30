@@ -37,10 +37,13 @@ app.listen(port, () => console.log(`Server is running on port ${port}`));
 // --- 2. إعداد الـ AI والبوت ومحرك تشغيل يوتيوب (yt-dlp) ---
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 
-// تقدر تضيف أكثر من مفتاح Gemini (من مشاريع مختلفة بنفس حسابك في Google) لتوسيع الحصة اليومية:
-// GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3 ... إلخ في متغيرات البيئة
-const GEMINI_KEYS = [GEMINI_API_KEY, ...[2, 3, 4, 5].map(i => process.env[`GEMINI_API_KEY_${i}`])]
-    .filter(Boolean);
+// تقدر تضيف أي عدد من مفاتيح Gemini (من مشاريع/حسابات مختلفة) لتوسيع الحصة اليومية:
+// GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3 ... بدون حد أقصى، بس رقّمها بالترتيب بدون فجوة
+const extraGeminiKeys = [];
+for (let i = 2; process.env[`GEMINI_API_KEY_${i}`]; i++) {
+    extraGeminiKeys.push(process.env[`GEMINI_API_KEY_${i}`]);
+}
+const GEMINI_KEYS = [GEMINI_API_KEY, ...extraGeminiKeys].filter(Boolean);
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 console.log(`مفاتيح Gemini المفعّلة: ${GEMINI_KEYS.length}`);
 const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.7-flash';
