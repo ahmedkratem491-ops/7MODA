@@ -1170,7 +1170,7 @@ client.on('interactionCreate', async (interaction) => {
 
 // --- 6. الـ AI للرد على الفورمز والـ Mentions ---
 client.on('messageCreate', async (message) => {
-    if (message.author.bot) return;
+    if (message.author.id === client.user.id || !message.guild) return;
 
     const isFormMessage = message.embeds.some(e => e.title?.toLowerCase().includes('form') || e.title?.includes('نموذج') || e.title?.includes('تقديم')) 
                           || message.content.toLowerCase().includes('form') 
