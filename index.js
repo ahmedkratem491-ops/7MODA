@@ -356,8 +356,15 @@ const warningsDB = new Map();
 const logChannelsDB = new Map();
 const autoChatSettings = new Map();
 const afkVoiceChannels = new Map();
+const aiEnabledDB = new Map(); // تشغيل/إيقاف كلام الذكاء الاصطناعي لكل سيرفر، افتراضياً شغّال
 const musicQueue = new Map(); // لا يُحفظ بالملف، مؤقت بالذاكرة فقط
 let autoChatInterval = null;
+
+// الشخص الوحيد المسموح له يتحكم بتشغيل/إيقاف الذكاء الاصطناعي، بغض النظر عن صلاحياته بالسيرفر
+const OWNER_ID = process.env.OWNER_ID || '890373927791124540';
+function isAiEnabled(guildId) {
+    return aiEnabledDB.get(guildId) !== false; // شغّال افتراضياً لو ما فيه إعداد محفوظ
+}
 
 function saveData() {
     try {
@@ -365,7 +372,8 @@ function saveData() {
             warnings: Array.from(warningsDB.entries()),
             logChannels: Array.from(logChannelsDB.entries()),
             autoChat: Array.from(autoChatSettings.entries()),
-            afkVoice: Array.from(afkVoiceChannels.entries())
+            afkVoice: Array.from(afkVoiceChannels.entries()),
+            aiEnabled: Array.from(aiEnabledDB.entries())
         };
         fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
     } catch (e) {
@@ -383,6 +391,7 @@ function loadData() {
         (data.logChannels || []).forEach(([key, value]) => logChannelsDB.set(key, value));
         (data.autoChat || []).forEach(([key, value]) => autoChatSettings.set(key, value));
         (data.afkVoice || []).forEach(([key, value]) => afkVoiceChannels.set(key, value));
+        (data.aiEnabled || []).forEach(([key, value]) => aiEnabledDB.set(key, value));
 
         console.log('✅ تم تحميل البيانات المحفوظة بنجاح.');
     } catch (e) {
@@ -541,6 +550,19 @@ const commands = [
         .setDescription('عرض كل أوامر البوت'),
 
     new SlashCommandBuilder()
+        .setName('ai')
+        .setDescription('تشغيل أو إيقاف كلام الذكاء الاصطناعي بالسيرفر (لمالك البوت فقط)')
+        .addStringOption(opt =>
+            opt.setName('status')
+                .setDescription('الحالة')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'تشغيل (ON)', value: 'on' },
+                    { name: 'إيقاف (OFF)', value: 'off' }
+                )
+        ),
+
+    new SlashCommandBuilder()
         .setName('warn')
         .setDescription('تحذير عضو وتسجيل التحذير فقط دون تايم أوت')
         .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
@@ -624,6 +646,7 @@ client.once('clientReady', async () => {
         autoChatInterval = setInterval(async () => {
             for (const [guildId, config] of autoChatSettings.entries()) {
                 if (!config.enabled || !config.channelId) continue;
+                if (!isAiEnabled(guildId)) continue;
                 if (!takeBackgroundBudget()) continue;
                 try {
                     const guild = await client.guilds.fetch(guildId).catch(() => null);
@@ -938,11 +961,24 @@ client.on('interactionCreate', async (interaction) => {
             .addFields(
                 { name: '🎵 الموسيقى', value: '`/play` `/skip` `/stop` `/pause` `/resume` `/loop` `/queue` `/nowplaying`' },
                 { name: '🛡️ الإدارة', value: '`/warn` `/history` `/unwarn` `/timeout` `/untimeout` `/kick` `/ban` `/unban`' },
-                { name: '⚙️ الإعدادات', value: '`/log` `/autochat` `/afkvoice`' }
+                { name: '⚙️ الإعدادات', value: '`/log` `/autochat` `/afkvoice` `/ai`' }
             )
             .setFooter({ text: 'اذكر البوت بأي رسالة عشان يرد عليك بالذكاء الاصطناعي' });
 
         return interaction.reply({ embeds: [embed] });
+    }
+
+    if (commandName === 'ai') {
+        if (interaction.user.id !== OWNER_ID) {
+            return interaction.reply({ content: '❌ هذا الأمر مخصص بس لمالك البوت.', flags: MessageFlags.Ephemeral });
+        }
+        const status = options.getString('status');
+        aiEnabledDB.set(guild.id, status === 'on');
+        saveData();
+        return interaction.reply({
+            content: status === 'on' ? '✅ تم تشغيل كلام الذكاء الاصطناعي بهذا السيرفر.' : '🔇 تم إيقاف كلام الذكاء الاصطناعي بهذا السيرفر.',
+            flags: MessageFlags.Ephemeral
+        });
     }
 
     if (commandName === 'warn') {
@@ -1171,6 +1207,7 @@ client.on('interactionCreate', async (interaction) => {
 // --- 6. الـ AI للرد على الفورمز والـ Mentions ---
 client.on('messageCreate', async (message) => {
     if (message.author.id === client.user.id || !message.guild) return;
+    if (!isAiEnabled(message.guild.id)) return; // كلام الذكاء الاصطناعي مطفي بهذا السيرفر (يتحكم فيه مالك البوت بأمر /ai)
 
     const isFormMessage = message.embeds.some(e => e.title?.toLowerCase().includes('form') || e.title?.includes('نموذج') || e.title?.includes('تقديم')) 
                           || message.content.toLowerCase().includes('form') 
