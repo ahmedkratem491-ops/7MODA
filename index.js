@@ -93,7 +93,7 @@ const chatHistory = new Map();
 function pushHistory(channelId, role, text) {
     const arr = chatHistory.get(channelId) || [];
     arr.push({ role, parts: [{ text }] });
-    while (arr.length > 10) arr.shift();
+    while (arr.length > 6) arr.shift();
     chatHistory.set(channelId, arr);
 }
 
@@ -109,6 +109,22 @@ function buildContents(channelId, fallbackPrompt) {
 // عميل Gemini منفصل لكل مفتاح، نبنيه مرة وحدة ونعيد استخدامه
 const geminiClients = GEMINI_KEYS.map(key => new GoogleGenAI({ apiKey: key }));
 let geminiKeyCursor = 0;
+
+// يحط مهلة زمنية قصوى لأي Promise، عشان لو مزود "تعلّق" بدون رد ننتقل للي بعده بسرعة بدل الانتظار للأبد
+function withTimeout(promise, ms, label) {
+    // لو الطلب الأصلي "خسر" السباق مع المهلة وبعدين فشل لاحقاً، هذا catch يمنع
+    // "Unhandled Promise Rejection" اللي يقدر يوقف Node.js كامل العملية بصمت
+    promise.catch(() => {});
+
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => {
+            const e = new Error(`${label} ما رد خلال ${ms / 1000} ثانية`);
+            e.status = 'timeout';
+            reject(e);
+        }, ms))
+    ]);
+}
 
 // يرسل طلب لـ Gemini، يدور بين كل المفاتيح المتوفرة (لو مفتاح وصل حده ينتقل للي بعده)،
 // مع إعادة محاولة عند انشغال الخدمة (503) وموديل احتياطي
@@ -129,20 +145,24 @@ async function askGeminiOnly(contents) {
         for (const model of models) {
             for (let attempt = 0; attempt < 2; attempt++) {
                 try {
-                    const result = await client.models.generateContent({
-                        model,
-                        contents,
-                        config: { systemInstruction: BOT_PERSONA }
-                    });
+                    const result = await withTimeout(
+                        client.models.generateContent({
+                            model,
+                            contents,
+                            config: { systemInstruction: BOT_PERSONA }
+                        }),
+                        8000,
+                        `Gemini (مفتاح ${idx + 1})`
+                    );
                     geminiKeyCursor = (idx + 1) % geminiClients.length;
                     return result;
                 } catch (e) {
                     lastError = e;
                     if (e?.status === 503 && attempt === 0) {
-                        await new Promise(r => setTimeout(r, 1500));
+                        await new Promise(r => setTimeout(r, 800));
                         continue; // نعيد نفس المفتاح والموديل مرة وحدة بس
                     }
-                    break; // 429 (خلصت حصة هذا المفتاح) أو خطأ دائم، جرب الموديل التالي أو المفتاح التالي
+                    break; // 429 (خلصت حصة هذا المفتاح)، تايم آوت، أو خطأ دائم، جرب الموديل التالي أو المفتاح التالي
                 }
             }
         }
@@ -230,7 +250,7 @@ async function askOpenAICompat(provider, contents, allowDiscovery = true) {
             temperature: 0.9,
             max_tokens: 400
         }),
-        signal: AbortSignal.timeout(20000)
+        signal: AbortSignal.timeout(8000)
     });
     if (!res.ok) {
         if (res.status === 404 && allowDiscovery) {
@@ -252,17 +272,8 @@ async function askOpenAICompat(provider, contents, allowDiscovery = true) {
 // نوزع الطلبات على المزودين الاحتياطيين بالتناوب عشان ما تخلص حصة واحد بسرعة
 let providerCursor = 0;
 
-// الدالة الرئيسية: Gemini أولاً (بكل مفاتيحه)، وإذا فشلت كلها ننتقل للمزودين الاحتياطيين (Groq وغيره)
-async function askAI(contents) {
-    if (geminiClients.length > 0) {
-        try {
-            const r = await askGeminiOnly(contents);
-            if (r?.text) return r;
-        } catch (e) {
-            console.error('كل مفاتيح Gemini فشلت، نجرب المزودين الاحتياطيين:', e.message);
-        }
-    }
-
+// يجرب المزودين الاحتياطيين (Mistral/Cerebras/OpenRouter) بالتناوب
+async function tryFallbackProviders(contents) {
     const count = PROVIDERS.length;
     for (let i = 0; i < count; i++) {
         const provider = PROVIDERS[(providerCursor + i) % count];
@@ -276,8 +287,48 @@ async function askAI(contents) {
             console.error(`${provider.name} فشل، نجرب اللي بعده:`, e.message);
         }
     }
+    return null;
+}
+
+// للمحادثة المباشرة (منشن/رد على البوت): Gemini أولاً للجودة، والمزودين الاحتياطيين لو فشل
+// حد أقصى زمني من البداية للنهاية عشان نضمن رد دايماً (حتى لو "مشغول") خلال وقت معقول
+async function askAI(contents) {
+    return withTimeout(askAIInternal(contents), 15000, 'الذكاء الاصطناعي');
+}
+
+async function askAIInternal(contents) {
+    if (geminiClients.length > 0) {
+        try {
+            const r = await askGeminiOnly(contents);
+            if (r?.text) return r;
+        } catch (e) {
+            console.error('كل مفاتيح Gemini فشلت، نجرب المزودين الاحتياطيين:', e.message);
+        }
+    }
+
+    const fallback = await tryFallbackProviders(contents);
+    if (fallback) return fallback;
 
     if (geminiClients.length === 0) return askGeminiOnly(contents); // يرمي رسالة الخطأ الواضحة لو ما فيه أي مزود أصلاً
+    throw new Error('كل المزودين فشلوا');
+}
+
+// للسوالف بالخلفية (autochat / الرد التلقائي بدون منشن): نفضّل المزودين الاحتياطيين أولاً
+// عشان نحافظ على حصة Gemini كاملة لمحادثتك المباشرة وياه، ونستخدم Gemini هنا كاحتياطي أخير بس
+async function askBackgroundAI(contents) {
+    return withTimeout(askBackgroundAIInternal(contents), 15000, 'الذكاء الاصطناعي');
+}
+
+async function askBackgroundAIInternal(contents) {
+    if (PROVIDERS.length > 0) {
+        const fallback = await tryFallbackProviders(contents);
+        if (fallback) return fallback;
+    }
+
+    if (geminiClients.length > 0) {
+        return askGeminiOnly(contents);
+    }
+
     throw new Error('كل المزودين فشلوا');
 }
 
@@ -398,6 +449,14 @@ function loadData() {
         console.error('خطأ في تحميل البيانات:', e);
     }
 }
+
+// شبكة أمان: أي خطأ غير متوقع بأي مكان بالكود يتسجل باللوق بس، وما يوقف البوت كامل بصمت
+process.on('unhandledRejection', (err) => {
+    console.error('⚠️ Unhandled Rejection (تم تجاهله، البوت يكمل شغاله):', err);
+});
+process.on('uncaughtException', (err) => {
+    console.error('⚠️ Uncaught Exception (تم تجاهله، البوت يكمل شغاله):', err);
+});
 
 const TOKEN = process.env.DISCORD_TOKEN || '';
 
@@ -655,7 +714,7 @@ client.once('clientReady', async () => {
                     if (!channel) continue;
 
                     // نقرأ آخر رسائل الروم عشان يعلّق على الحوار الحالي بدل ما يرمي كلام عشوائي
-                    const recent = await channel.messages.fetch({ limit: 12 }).catch(() => null);
+                    const recent = await channel.messages.fetch({ limit: 6 }).catch(() => null);
                     const transcript = recent
                         ? [...recent.values()].reverse()
                             .filter(m => m.content)
@@ -667,7 +726,7 @@ client.once('clientReady', async () => {
                         ? `هذي آخر رسائل الروم:\n${transcript}\n\nاكتب مداخلة قصيرة وطبيعية تعلّق فيها على الكلام أو تفتح موضوع جانبي مرتبط فيه، كأنك واحد من الشلة.`
                         : 'الروم هادي. افتح موضوع سوالف خفيف ومسلي بجملة أو جملتين.';
 
-                    const response = await askAI(prompt);
+                    const response = await askBackgroundAI(prompt);
                     await channel.send(response.text);
                 } catch (e) {
                     console.error('خطأ في الـ Auto-Chat:', e);
@@ -1247,7 +1306,7 @@ client.on('messageCreate', async (message) => {
         if (now - last >= AUTOREPLY_COOLDOWN_MS && Math.random() < AUTOREPLY_CHANCE && takeBackgroundBudget()) {
             autoReplyCooldown.set(message.channel.id, now); // نسجل الوقت قبل الطلب عشان ما يتكرر
             try {
-                const recent = await message.channel.messages.fetch({ limit: 10 }).catch(() => null);
+                const recent = await message.channel.messages.fetch({ limit: 6 }).catch(() => null);
                 const transcript = recent
                     ? [...recent.values()].reverse()
                         .filter(m => m.content)
@@ -1255,7 +1314,7 @@ client.on('messageCreate', async (message) => {
                         .join('\n')
                     : `${message.author.username}: ${message.content}`;
 
-                const response = await askAI(
+                const response = await askBackgroundAI(
                     `هذي آخر رسائل الروم:\n${transcript}\n\nانت واحد من الشلة وقاعد تقرا الكلام. لو عندك تعليق أو مزحة أو سؤال طبيعي يناسب الحوار الأخير، اكتبه بجملة أو جملتين. لو ما في شي يستاهل تقوله، اكتب كلمة SKIP فقط.`
                 );
                 const text = (response.text || '').trim();
